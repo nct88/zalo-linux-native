@@ -1,0 +1,122 @@
+name: Build
+
+# Pushes to main and pull requests: build only (artifacts kept 7 days).
+# A tag vX.Y.Z (matching package.json's version): build and publish the
+# release with the AppImages.
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      zalo_version:
+        description: 'Zalo version (empty: the latest macOS release)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      zalo_version: ${{ steps.build.outputs.zalo_version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(node -p "require('./package.json').version")
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != package.json v$version"; exit 1; }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Electron
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/electron
+          key: ${{ runner.os }}-${{ matrix.arch }}-electron-${{ hashFiles('package-lock.json') }}
+
+      - name: Zalo version
+        id: zalo
+        env:
+          ZALO_VERSION: ${{ github.event.inputs.zalo_version }}
+        run: node scripts/check-versions.js
+
+      - name: Cache Zalo DMG
+        uses: actions/cache@v4
+        with:
+          path: temp
+          key: zalo-dmg-${{ steps.zalo.outputs.zalo_version }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            nativelibs/*/target
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('nativelibs/*/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.arch }}-cargo-
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential liblzma-dev p7zip-full clang libclang-dev llvm zsync
+
+      - run: npm ci --no-audit --no-fund
+
+      - name: Setup and build
+        id: build
+        env:
+          ZALO_VERSION: ${{ steps.zalo.outputs.zalo_version }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: npm run main
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Zalo-Linux-Native-${{ matrix.arch }}
+          path: dist/Zalo-Linux-Native-*.AppImage*
+          retention-days: 7
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Zalo Linux Native ${{ github.ref_name }}
+          files: dist/*.AppImage*
+          body: |
+            Zalo for Linux with a native call engine — Zalo ${{ needs.build.outputs.zalo_version }} inside.
+
+            **Install:** download the AppImage for your architecture (x86_64 or aarch64), not the `.zsync` file (that one is for updates). With [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever): Open → the AppImage → Unlock → Move to the app menu. Gear Lever offers later versions from this repository's releases.
+
+            **Calls** need `python3`, libopus and the PulseAudio tools (`pulseaudio-utils`; `libpulse` on Arch). The first call shows the install command for your distribution.
+
+            See the [README](https://github.com/${{ github.repository }}#readme) (Tiếng Việt / English).

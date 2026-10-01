@@ -1,0 +1,89 @@
+{
+  "name": "zalo-linux-native",
+  "version": "1.0.0",
+  "description": "Zalo for Linux with a native call engine: voice and video calls and screen sharing without Wine",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "check-versions": "node scripts/check-versions.js",
+    "download-dmg": "node scripts/download-dmg.js",
+    "prepare-app": "node scripts/prepare-app.js",
+    "build": "node scripts/build.js",
+    "main": "SETUP=true BUILD=true node scripts/main.js",
+    "main:setup": "SETUP=true node scripts/main.js",
+    "main:build": "BUILD=true node scripts/main.js"
+  },
+  "keywords": [
+    "zalo",
+    "linux",
+    "calls",
+    "native",
+    "appimage"
+  ],
+  "author": "nct88",
+  "license": "MIT",
+  "homepage": "https://github.com/nct88/zalo-linux-native",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nct88/zalo-linux-native.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nct88/zalo-linux-native/issues"
+  },
+  "devDependencies": {
+    "@electron/asar": "^4.0.1",
+    "electron": "^22.3.27",
+    "electron-builder": "^26.0.12",
+    "sqlite3": "^6.0.1"
+  },
+  "build": {
+    "appId": "com.zalo.linux",
+    "productName": "Zalo",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "package.json",
+      "plugins/**/*",
+      "assets/**/*"
+    ],
+    "extraFiles": [
+      {
+        "from": "app",
+        "to": "app",
+        "filter": [
+          "**/*",
+          "!node_modules",
+          "!package-lock.json"
+        ]
+      },
+      {
+        "from": "zcall-native",
+        "to": "zcall-native"
+      }
+    ],
+    "asarUnpack": [
+      "**/*.node"
+    ],
+    "buildDependenciesFromSource": false,
+    "nodeGypRebuild": false,
+    "npmRebuild": false,
+    "linux": {
+      "executableName": "zalo",
+      "target": "AppImage",
+      "category": "Network",
+      "desktop": {
+        "entry": {
+          "StartupWMClass": "zalo"
+        }
+      },
+      "synopsis": "Zalo messaging app for Linux",
+      "description": "Unofficial port of Zalo messaging application for Linux systems.",
+      "icon": "app/pc-dist/favicon-512x512.png"
+    }
+  },
+  "dependencies": {
+    "fs-extra": "^11.4.0"
+  }
+}
