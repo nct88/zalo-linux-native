@@ -112,6 +112,7 @@ jobs:
         with:
           name: Zalo Linux Native ${{ github.ref_name }}
           files: dist/*.AppImage*
+          generate_release_notes: true  # the changes since the previous tag, after the body
           body: |
             Zalo for Linux with a native call engine — Zalo ${{ needs.build.outputs.zalo_version }} inside.
 
