@@ -694,43 +694,45 @@ const ROUNDED_PRELOAD_INJECTION = `
     }).catch(() => {});
   } catch (_) {}
 
+  // Dragging the window by a header. The drag starts only once the pointer
+  // has moved a few pixels: a press and release in place stays a click, so
+  // Zalo's own controls in the header (the back arrow of the narrow layout
+  // is a div.z--btn--v2, not a <button>) keep working.
+  const NO_DRAG = "button, a, input, select, textarea, [role='button'], .clickable, .z--btn--v2, #headerBtns, " +
+    ".zalo-linux-close-button, .zalo-linux-win-button, #zalo-linux-theme-toggle";
+  const DRAG_THRESHOLD = 4;
+
   function attachDrag(el) {
     if (!el || el.__zalo_drag_attached) return;
     el.__zalo_drag_attached = true;
 
-    let isDragging = false;
-    let startScreenX = 0;
-    let startScreenY = 0;
+    let pending = null; // { id, x, y } from pointerdown until the drag starts or the button is released
+    let dragging = false;
 
     function stopDrag(e) {
-      if (isDragging) {
-        isDragging = false;
-        try {
-          if (e && e.pointerId !== undefined) {
-            el.releasePointerCapture(e.pointerId);
-          }
-        } catch (_) {}
-        ipcRenderer.send("zalo-window-drag-end");
-      }
+      pending = null;
+      if (!dragging) return;
+      dragging = false;
+      try { if (e && e.pointerId !== undefined) el.releasePointerCapture(e.pointerId); } catch (_) {}
+      ipcRenderer.send("zalo-window-drag-end");
     }
 
     el.addEventListener("pointerdown", (e) => {
-      if (e.button !== 0) return;
-      if (e.target.closest("button, a, input, select, textarea, [role='button'], .clickable, #headerBtns, .zalo-linux-close-button, .zalo-linux-win-button, #zalo-linux-theme-toggle")) {
-        return;
-      }
-      try { el.setPointerCapture(e.pointerId); } catch (_) {}
-      isDragging = true;
-      startScreenX = e.screenX;
-      startScreenY = e.screenY;
-      ipcRenderer.send("zalo-window-drag-start");
+      if (e.button !== 0 || e.target.closest(NO_DRAG)) return;
+      pending = { id: e.pointerId, x: e.screenX, y: e.screenY };
     });
 
     el.addEventListener("pointermove", (e) => {
-      if (!isDragging) return;
-      const deltaX = e.screenX - startScreenX;
-      const deltaY = e.screenY - startScreenY;
-      ipcRenderer.send("zalo-window-drag-move", { deltaX, deltaY });
+      if (!pending && !dragging) return;
+      if (!dragging) {
+        if (Math.abs(e.screenX - pending.x) < DRAG_THRESHOLD && Math.abs(e.screenY - pending.y) < DRAG_THRESHOLD) return;
+        dragging = true;
+        pending.x = e.screenX; // the window follows from here: no jump
+        pending.y = e.screenY;
+        try { el.setPointerCapture(pending.id); } catch (_) {}
+        ipcRenderer.send("zalo-window-drag-start");
+      }
+      ipcRenderer.send("zalo-window-drag-move", { deltaX: e.screenX - pending.x, deltaY: e.screenY - pending.y });
     });
 
     el.addEventListener("pointerup", stopDrag);
@@ -739,10 +741,7 @@ const ROUNDED_PRELOAD_INJECTION = `
     window.addEventListener("pointercancel", stopDrag);
 
     el.addEventListener("dblclick", (e) => {
-      if (e.button !== 0) return;
-      if (e.target.closest("button, a, input, select, textarea, [role='button'], .clickable, #headerBtns, .zalo-linux-close-button, .zalo-linux-win-button, #zalo-linux-theme-toggle")) {
-        return;
-      }
+      if (e.button !== 0 || e.target.closest(NO_DRAG)) return;
       ipcRenderer.send("zalo-window-toggle-maximize");
     });
   }
