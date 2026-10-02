@@ -9,6 +9,13 @@
 //                    ReqForward status every 1 s.
 //   stop()           EndCall, stop audio.
 //
+// Group calls (params.group, docs/GROUP-CALL.md): the servers of
+// group_request callSetting (SFU, port 3000), the group InitZRTP (subCmd 4)
+// and ZaviPing (cmd 0x33), no P2P and no ReqForward. Every member's audio
+// comes down as type 4 with SSRC = the member's UID, under the one session
+// key; audio-io mixes them (--mix). The server tells who is in the room
+// (cmd 50, 'roster') and who left (cmd 3, 'memberLeft' / 'peerEnd').
+//
 // Packets leave the machine only when sendUdp is true (zcall-native.js
 // --media zrtc --send-udp). Every packet format here is checked byte for byte
 // against the real engine by native-engine/wire-check.js.
@@ -23,6 +30,10 @@ const {
   COMMANDS,
   wrapMediaPacket,
   buildInitZrtpPacket,
+  buildGroupInitZrtpPacket,
+  GROUP_INIT_LAYOUTS,
+  buildZaviPingPacket,
+  parseRoomUpdated,
   buildPingPacket,
   buildEndCallPacket,
   buildReqForwardPacket,
@@ -35,7 +46,7 @@ const {
   wrapP2pVideo,
   unwrapPacket,
 } = require('../zrtp-packet');
-const { masterFromSessId, sessionKeys, unprotectRtp, protectRtp } = require('../srtp-aes');
+const { masterFromSessId, sessionKeys, parseRtp, unprotectRtp, protectRtp } = require('../srtp-aes');
 const { FRAME_SAMPLES, buildAudioRtpHeader } = require('../rtp');
 const { packetizeFrame, KEY_PT, DELTA_PT } = require('../video');
 
@@ -44,6 +55,9 @@ const INIT_WAIT_MS = 600;        // all servers answered InitZRTP within ~35 ms
 const INIT_RETRY_MS = 1000;
 const INIT_TRIES = 3;
 const PING_INTERVAL_MS = 6000;   // Ping to the kept server
+// Group ZaviPing period: the real engine takes it from its config
+// (GroupCallController +0x85c), value not known yet.
+const GROUP_PING_INTERVAL_MS = Number(process.env.ZCALL_GROUP_PING_MS) || 5000;
 const STATUS_INTERVAL_MS = 1000; // ReqForward sub 10
 const MEDIA_TIMEOUT_MS = 20000;  // no audio from the peer for this long: give up
 // P2P binding to the peer's candidates, as the real engine paces it:
@@ -96,6 +110,7 @@ class ZrtcMediaBackend extends EventEmitter {
     this.activeServer = null;
     this.serverToken = 0;
     this.replies = []; // { server, token, rttMs, publicAddr }
+    this.refusals = []; // { server, res, hex }: InitZRTP refused
     this.ended = new Set(); // servers already sent EndCall
     this.srtpContext = null;
     this.audio = null;
@@ -117,12 +132,16 @@ class ZrtcMediaBackend extends EventEmitter {
     this.roc = 0;
     this.fwdSeq = 1;
     this.rxRoc = new RocTracker();
+    this.rxRocs = new Map(); // group: one per member (SSRC)
+    this.members = new Map(); // group: SSRC -> packets received
     this.counters = { tx: 0, rx: 0, rxBad: 0, rxSecond: 0, rxP2p: 0 };
     this.rxTypes = {};
     this.p2pPath = null; // { host, port } once the peer reached us directly
     this.p2pSeen = false;
     this.videoStats = { pkts: 0, bad: 0, pt: {}, head: {}, marker: 0 };
     this.videoRoc = new RocTracker();
+    this.videoRocs = new Map(); // group: per member (SSRC)
+    this.videoMembers = new Map(); // group: SSRC -> { pkts, pt, head }
     this.p2pSeq = 0;
     this.lastRxAt = 0;
     this.startedAt = 0;
@@ -141,6 +160,7 @@ class ZrtcMediaBackend extends EventEmitter {
 
   onNegotiated(params) {
     this.params = params || {};
+    this.group = !!this.params.group;
     this.servers = [];
     const list = Array.isArray(this.params.servers) ? this.params.servers : [];
     for (const s of list) {
@@ -154,7 +174,18 @@ class ZrtcMediaBackend extends EventEmitter {
     this._resetCounters();
     this.log('media: negotiated', { servers: this.servers.length, srtpMode: this.params.srtpMode, sendUdp: this.sendUdp });
     this.srtpContext = null;
-    const sess = this.params.sessId;
+    this.plainMedia = false;
+    // Group: the SRTP key is zrtcConfig.srtpKey and nothing else
+    // (GroupZRtcConfig +0x2a0 -> GroupCallPeer +0x340 -> createAndInitSRTP;
+    // no fallback to the session as in 1-1). Empty, createAndInitSRTP fails
+    // and GroupCallPeer sends and reads plain RTP (_processReceiveZRtcPacket
+    // skips SrtpTransport when there is none). Live test 2026-10-01: empty.
+    const groupKey = this.group ? String((this.params.config || {}).srtpKey || '') : '';
+    if (this.group && !groupKey) {
+      this.plainMedia = true;
+      this.log('media: group call without srtpKey: plain RTP, as ZaloCall does');
+    }
+    const sess = this.group ? groupKey : this.params.sessId;
     if (sess && String(sess).length >= 30) {
       try {
         this.srtpContext = sessionKeys(masterFromSessId(sess));
@@ -173,15 +204,56 @@ class ZrtcMediaBackend extends EventEmitter {
       return Promise.resolve(null);
     }
     this._initSocket();
+    if (this.group) return this._prepareGroup();
+    return this._initZrtp(buildInitZrtpPacket({
+      role,
+      uid: this.params.localUid || 0,
+      peerUid: this.params.peerUid || 0,
+      callId: this.params.callId || 0,
+      sessId: this.params.sessId || '',
+    }));
+  }
+
+  // Group InitZRTP: the payload layout is not settled (docs/GROUP-CALL.md
+  // §2), so a refusal moves on to the next candidate. The one that works is
+  // kept in <ZCALL_LOG_DIR>/group-init-layout and tried first next time;
+  // ZCALL_GROUP_INIT_LAYOUT forces one.
+  async _prepareGroup() {
+    const saved = process.env.ZCALL_LOG_DIR ? path.join(process.env.ZCALL_LOG_DIR, 'group-init-layout') : null;
+    let first = process.env.ZCALL_GROUP_INIT_LAYOUT || '';
+    if (!first && saved) try { first = fs.readFileSync(saved, 'utf8').trim(); } catch (_) {}
+    const layouts = process.env.ZCALL_GROUP_INIT_LAYOUT ? [first]
+      : [...new Set([first, ...GROUP_INIT_LAYOUTS].filter((l) => GROUP_INIT_LAYOUTS.includes(l)))];
+    for (const layout of layouts) {
+      if (!this.active) return null;
+      this.replies = [];
+      this.refusals = [];
+      const best = await this._initZrtp(buildGroupInitZrtpPacket({
+        host: !!this.params.host,
+        uid: this.params.localUid || 0,
+        sessId: this.params.sessId || '',
+        callId: this.params.callId || 0,
+        hostCall: this.params.hostCall || 0,
+        layout,
+      }));
+      if (best) {
+        this.log(`media: group InitZRTP accepted with layout "${layout}"`);
+        if (saved && layout !== first) try { fs.writeFileSync(saved, layout + '\n'); } catch (_) {}
+        return best;
+      }
+      if (!this.refusals.length) return null; // no answer at all: network, not the layout
+      this.log(`media: group InitZRTP layout "${layout}" refused: ${this.refusals.map((r) => `res ${r.res} (${r.hex})`).join(', ')}`);
+    }
+    return null;
+  }
+
+  // Send one InitZRTP packet to every server; resolves with the fastest
+  // accepting reply { server, token, rttMs, publicAddr }, or null once every
+  // server refused (this.refusals) or the tries ran out.
+  _initZrtp(packet) {
+    this.refusals = [];
     return new Promise((resolve) => {
       let tries = 0;
-      const packet = buildInitZrtpPacket({
-        role,
-        uid: this.params.localUid || 0,
-        peerUid: this.params.peerUid || 0,
-        callId: this.params.callId || 0,
-        sessId: this.params.sessId || '',
-      });
       const send = () => {
         tries++;
         this.initSentAt = Date.now();
@@ -191,7 +263,7 @@ class ZrtcMediaBackend extends EventEmitter {
       };
       const finish = () => {
         this._onInitReply = null;
-        if (!this.replies.length) { this.log('media: no server answered InitZRTP'); resolve(null); return; }
+        if (!this.replies.length) { this.log(this.refusals.length ? 'media: every server refused InitZRTP' : 'media: no server answered InitZRTP'); resolve(null); return; }
         const best = this.replies.reduce((a, b) => (b.rttMs < a.rttMs ? b : a));
         this.activeServer = best.server;
         this.serverToken = best.token;
@@ -200,11 +272,11 @@ class ZrtcMediaBackend extends EventEmitter {
       };
       let waiting = null;
       this._onInitReply = () => {
-        if (this.replies.length === this.servers.length) { clearTimeout(waiting); this.timers.delete(waiting); finish(); return; }
+        if (this.replies.length + this.refusals.length >= this.servers.length) { clearTimeout(waiting); this.timers.delete(waiting); finish(); return; }
         if (!waiting) waiting = this._timer(finish, INIT_WAIT_MS);
       };
       const retry = () => {
-        if (!this._onInitReply || this.replies.length) return;
+        if (!this._onInitReply || this.replies.length || this.refusals.length) return;
         if (tries >= INIT_TRIES) { finish(); return; }
         send();
         this._timer(retry, INIT_RETRY_MS);
@@ -231,6 +303,15 @@ class ZrtcMediaBackend extends EventEmitter {
     this.log('media: started');
     this.startedAt = Date.now();
     this.lastRxAt = Date.now();
+    if (this.group) {
+      // Members may all be muted: no media timeout, the server's cmd 3 and
+      // Zalo's group_end_call end the call.
+      this._sendPing();
+      this._timer(() => this._sendPing(), GROUP_PING_INTERVAL_MS, true);
+      this._timer(() => this._checkGroupKey(), 3000);
+      if (this.audioEnabled) this._startAudio();
+      return;
+    }
     this._timer(() => this._sendPing(), PING_INTERVAL_MS, true);
     this._timer(() => this._sendStatus(), STATUS_INTERVAL_MS, true);
     this._timer(() => this._send(this._fwd(8, Buffer.from([4, 0, 0, 0, 0, 0, 0, 0]), 0), this.activeServer, 'ReqForward'), 200);
@@ -334,7 +415,7 @@ class ZrtcMediaBackend extends EventEmitter {
       if (this.activeServer && this.serverToken) this._sendEndCall(this.activeServer, this.serverToken);
       for (const r of this.replies) this._sendEndCall(r.server, r.token);
     }
-    if (this.startedAt) this.log('media: stopped', JSON.stringify({ ...this.counters, rxTypes: this.rxTypes, video: this.videoStats, videoTx: this.vTx, keyRequests: this.keyRequests }));
+    if (this.startedAt) this.log('media: stopped', JSON.stringify({ ...this.counters, rxTypes: this.rxTypes, video: this.videoStats, videoTx: this.vTx, keyRequests: this.keyRequests, members: Object.fromEntries(this.members), videoMembers: Object.fromEntries(this.videoMembers) }));
     this.startedAt = 0;
     this.active = false;
     this._onInitReply = null;
@@ -354,6 +435,17 @@ class ZrtcMediaBackend extends EventEmitter {
     return { ...this.counters, durationMs: this.startedAt ? Date.now() - this.startedAt : 0 };
   }
 
+  // Group: the SRTP key is assumed to be the 1-1 one (session[:30] + KDF;
+  // GroupCallPeer::createAndInitSRTP uses the same SrtpTransport). Received
+  // packets check it: say so in the log either way.
+  _checkGroupKey() {
+    const { rx, rxBad } = this.counters;
+    if (this.plainMedia) this.log(`media: group plain RTP: ${rx} good, ${rxBad} bad, ${this.members.size} member(s) heard`);
+    else if (rx) this.log(`media: group SRTP key OK (${rx} good, ${rxBad} bad, ${this.members.size} member(s) heard)`);
+    else if (rxBad) this.log(`media: group SRTP key WRONG? ${rxBad} audio packets failed authentication, none passed`);
+    else this.log('media: no group audio yet (members muted, or nothing forwarded)');
+  }
+
   _startAudio() {
     const script = path.join(__dirname, '..', 'audio-io.py');
     // zrtc_config audioBitrate (20) is only where the real engine starts: its
@@ -362,6 +454,7 @@ class ZrtcMediaBackend extends EventEmitter {
     const args = [script];
     if (this.devices.mic) args.push('--mic', this.devices.mic);
     if (this.devices.speaker) args.push('--speaker', this.devices.speaker);
+    if (this.group) args.push('--mix');
     if (process.env.ZCALL_AUDIO_ARGS) args.push(...process.env.ZCALL_AUDIO_ARGS.split(' ').filter(Boolean));
     this.audio = spawn('python3', args, { stdio: ['pipe', 'pipe', 'pipe'] });
     // audio-io's own messages go to the engine log.
@@ -389,10 +482,11 @@ class ZrtcMediaBackend extends EventEmitter {
   }
 
   _sendAudioFrame(opus) {
-    if (!this.active || !this.activeServer || !this.srtpContext) return;
+    if (!this.active || !this.activeServer || (!this.srtpContext && !this.plainMedia)) return;
     const ssrc = this.params.localUid >>> 0;
     const hdr = buildAudioRtpHeader({ seq: this.seq, ts: this.ts, ssrc, twSeq: this.twSeq });
-    const rtp = protectRtp(hdr, Buffer.from(opus), this.srtpContext, this.seq, ssrc, this.roc);
+    const rtp = this.plainMedia ? Buffer.concat([hdr, Buffer.from(opus)])
+      : protectRtp(hdr, Buffer.from(opus), this.srtpContext, this.seq, ssrc, this.roc);
     this._send(wrapMediaPacket({ msgType: MSG_TYPES.AUDIO_RTP, token: this.serverToken, payload: rtp }), this.activeServer, 'audio');
     // Same packet over P2P once the peer reached us: it drops duplicates by seq.
     if (this.p2pPath) this._send(wrapP2pAudio({ role: this.params.role, callId: this.params.callId, rtp }), this.p2pPath, 'P2P audio');
@@ -454,6 +548,11 @@ class ZrtcMediaBackend extends EventEmitter {
   }
 
   _sendPing() {
+    if (this.group) {
+      const uid = this.params.localUid || 0;
+      this._send(buildZaviPingPacket({ uid, token: this.serverToken, sessId: this.params.sessId || '' }), this.activeServer, 'ZaviPing');
+      return;
+    }
     const packet = buildPingPacket({ uid: this.params.localUid || 0, token: this.serverToken, sessId: this.params.sessId || '' });
     this._send(packet, this.activeServer, 'Ping');
   }
@@ -484,9 +583,19 @@ class ZrtcMediaBackend extends EventEmitter {
     if (p.msgType === MSG_TYPES.SERVER_REPLY && (p.cmd === COMMANDS.INIT_CALL_CALLER || p.cmd === COMMANDS.INIT_CALL_CALLEE)) {
       const server = this.servers.find((s) => s.host === rinfo.address && s.port === rinfo.port);
       if (!server || this.replies.some((r) => r.server === server)) return;
-      if (p.res !== 0) { this.log('media: InitZRTP refused, res =', p.res); return; }
+      if (p.res !== 0) {
+        if (this.refusals.some((r) => r.server === server)) return;
+        this.log('media: InitZRTP refused, res =', p.res, 'reply', msg.toString('hex'));
+        this.refusals.push({ server, res: p.res, hex: msg.subarray(18).toString('hex') });
+        if (this._onInitReply) this._onInitReply();
+        return;
+      }
       this.replies.push({ server, token: p.serverToken, rttMs: Date.now() - this.initSentAt, publicAddr: p.publicAddr });
       if (this._onInitReply) this._onInitReply();
+      return;
+    }
+    if (this.group && p.msgType === MSG_TYPES.SERVER_REPLY && (p.cmd === COMMANDS.END_CALL || p.cmd === COMMANDS.ROOM_UPDATED)) {
+      if (this.active && this.startedAt) this._onGroupControl(p);
       return;
     }
     // The server tells us the peer hung up (seen 20 ms before control end_call).
@@ -519,14 +628,36 @@ class ZrtcMediaBackend extends EventEmitter {
   // Received video: decrypt (own ROC: same SSRC as audio), then hand the
   // RTP payload on. Stats + optional dump (ZCALL_DUMP_VIDEO=1) for analysis.
   _onVideo(rtp) {
-    if (!this.srtpContext || rtp.length < 12) return;
+    if ((!this.srtpContext && !this.plainMedia) || rtp.length < 12) return;
     const seq = rtp.readUInt16BE(2);
-    const roc = this.videoRoc.guess(seq);
-    const got = unprotectRtp(rtp, this.srtpContext, roc);
+    // Group: one stream per member (SSRC), each with its own ROC.
+    let tracker = this.videoRoc;
+    if (this.group) {
+      const ssrc = rtp.readUInt32BE(8);
+      tracker = this.videoRocs.get(ssrc);
+      if (!tracker) { tracker = new RocTracker(); this.videoRocs.set(ssrc, tracker); }
+    }
+    const roc = tracker.guess(seq);
+    let got = null;
+    if (this.plainMedia) {
+      const p = (rtp[0] >> 6) === 2 ? parseRtp(rtp) : null;
+      if (p && p.payload.length) got = { seq: p.seq, ssrc: p.ssrc, opus: p.payload };
+    } else got = unprotectRtp(rtp, this.srtpContext, roc);
     const v = this.videoStats;
     v.pkts++;
     if (!got) { v.bad++; return; }
-    this.videoRoc.update(seq, roc);
+    tracker.update(seq, roc);
+    this.lastRxAt = Date.now();
+    if (this.group) {
+      // What the group packetization looks like (not captured before):
+      // PTs and the first payload bytes, per member.
+      let m = this.videoMembers.get(got.ssrc);
+      if (!m) { m = { pkts: 0, pt: {}, head: {} }; this.videoMembers.set(got.ssrc, m); this.log('media: first video from member', got.ssrc, 'PT', rtp[1] & 0x7f); }
+      m.pkts++;
+      m.pt[rtp[1] & 0x7f] = (m.pt[rtp[1] & 0x7f] || 0) + 1;
+      const hd = got.opus.subarray(0, got.opus[0] === 0x1c ? 2 : 5).toString('hex');
+      if (Object.keys(m.head).length < 12 || m.head[hd]) m.head[hd] = (m.head[hd] || 0) + 1;
+    }
     const pt = rtp[1] & 0x7f;
     const marker = !!(rtp[1] & 0x80);
     const ts = rtp.readUInt32BE(4);
@@ -542,18 +673,58 @@ class ZrtcMediaBackend extends EventEmitter {
       h.writeUInt16BE(seq, 4);
       h.writeUInt32BE(ts, 6);
       h[10] = pt | (marker ? 0x80 : 0);
-      try { fs.appendFileSync(require('path').join(process.env.ZCALL_LOG_DIR, 'video-dump.bin'), Buffer.concat([h, got.opus])); } catch (_) {}
+      try { fs.appendFileSync(require('path').join(process.env.ZCALL_LOG_DIR, this.group ? `video-dump-${got.ssrc}.bin` : 'video-dump.bin'), Buffer.concat([h, got.opus])); } catch (_) {}
     }
-    this.emit('video', { seq, ts, pt, marker, payload: got.opus, roc });
+    this.emit('video', { seq, ts, pt, marker, payload: got.opus, roc, ssrc: got.ssrc });
+  }
+
+  // GroupCallController::handleZRTPPacket: cmd 50 = the UIDs in the room
+  // (header UID = ours); cmd 3 = someone left, header UID = who, subCmd =
+  // reason. Our own UID: subCmd 1 the host ended the meeting, 2 we were kicked.
+  _onGroupControl(p) {
+    const ours = (this.params.localUid || 0) >>> 0;
+    if (p.cmd === COMMANDS.ROOM_UPDATED) {
+      if (p.uid !== ours) return;
+      const uids = parseRoomUpdated(p.data);
+      if (!uids) return;
+      this.log('media: room', uids.join(','));
+      this.emit('roster', uids.filter((u) => u && u !== ours));
+      return;
+    }
+    if (p.uid === ours) {
+      // Reason 0 / 0x62 about ourselves is not acted on by the real engine
+      // (only 1 and 2 are); 0x62 came ~60 s into the live test of 2026-10-01.
+      if (p.subCmd !== 1 && p.subCmd !== 2) { this.log('media: CMD_CLOSE about us, reason', p.subCmd, '(ignored, as ZaloCall)'); return; }
+      this.log('media: removed from the room, reason', p.subCmd);
+      this.emit('peerEnd', p.subCmd === 2 ? 'kicked' : 'host-ended');
+    } else {
+      this.log('media: member left', p.uid, 'reason', p.subCmd);
+      this.emit('memberLeft', p.uid, p.subCmd);
+    }
   }
 
   _onAudio(rtp) {
-    if (!this.srtpContext || rtp.length < 12) return;
+    if ((!this.srtpContext && !this.plainMedia) || rtp.length < 12) return;
     const seq = rtp.readUInt16BE(2);
-    const roc = this.rxRoc.guess(seq);
-    const got = unprotectRtp(rtp, this.srtpContext, roc);
+    let tracker = this.rxRoc;
+    if (this.group) {
+      const ssrc = rtp.readUInt32BE(8);
+      tracker = this.rxRocs.get(ssrc);
+      if (!tracker) { tracker = new RocTracker(); this.rxRocs.set(ssrc, tracker); }
+    }
+    const roc = tracker.guess(seq);
+    let got = null;
+    if (this.plainMedia) {
+      const p = (rtp[0] >> 6) === 2 ? parseRtp(rtp) : null;
+      if (p && p.payload.length) got = { seq: p.seq, ssrc: p.ssrc, opus: p.payload };
+    } else got = unprotectRtp(rtp, this.srtpContext, roc);
     if (!got) { this.counters.rxBad++; return; }
-    this.rxRoc.update(seq, roc);
+    tracker.update(seq, roc);
+    if (this.group) {
+      const n = (this.members.get(got.ssrc) || 0) + 1;
+      this.members.set(got.ssrc, n);
+      if (n === 1) { this.log('media: first audio from member', got.ssrc); this.emit('memberAudio', got.ssrc); }
+    }
     this.counters.rx++;
     this.counters.rxSecond++;
     this.lastRxAt = Date.now();

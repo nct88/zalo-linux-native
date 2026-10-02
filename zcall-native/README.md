@@ -3,7 +3,7 @@
 Native Linux call engine for Zalo-Linux: it speaks Zalo's call-v2 IPC, the
 ZRTP relay protocol, P2P, SRTP, Opus and H.264 itself, in place of Zalo's
 `ZaloCall` helper. **Generated** by `tools/export-engine.sh` of
-Zalo-Linux-Test at commit `59fe472`: edit it there (protocol notes, tests,
+Zalo-Linux-Native-Dev at commit `1926900`: edit it there (protocol notes, tests,
 captures), then export again.
 
 ## What works
@@ -15,7 +15,9 @@ captures), then export again.
   minimize / compact
 - sharing the screen in 1-1 video calls (PipeWire portal on Wayland)
 - WebRTC echo cancellation, noise suppression and gain control (PipeWire)
-- not yet: group calls (Zalo shows a "not supported" notice)
+- group calls: by default Zalo shows a "not supported" notice;
+  `ZCALL_GROUP=1` answers incoming group calls, audio only (experimental,
+  not yet tried against Zalo's servers)
 
 ## How Zalo-Linux runs it
 

@@ -23,9 +23,13 @@ const REORDER_MS = 200;
 const MAX_PENDING = 30; // incomplete frames kept (by timestamp)
 
 class VideoAssembler {
-  constructor(onFrame, now = () => Date.now()) {
+  // group: any PT (the group packetization is not captured yet), key frames
+  // told by their NAL units (SPS / IDR), and the H.264 SVC units (14 prefix,
+  // 15 subset SPS, 20 extension) dropped so the base layer decodes as AVC.
+  constructor(onFrame, now = () => Date.now(), { group = false } = {}) {
     this.onFrame = onFrame; // ({ key, data, ts })
     this.now = now;
+    this.group = group;
     this.pending = new Map(); // ts -> { parts: Map(idx -> payload), key, end }
     this.ready = new Map(); // first idx -> { key, data, ts, last, since }
     this.lastIdx = -1; // last packet of the last frame handed on
@@ -34,7 +38,7 @@ class VideoAssembler {
   }
 
   push({ ts, pt, marker, payload, seq, roc = 0 }) {
-    if (!VIDEO_PTS.has(pt) || !payload.length) return;
+    if ((!this.group && !VIDEO_PTS.has(pt)) || !payload.length) return;
     const idx = roc * 0x10000 + seq;
     if (idx <= this.lastIdx) return; // late, or a duplicate (relay + P2P)
     let f = this.pending.get(ts);
@@ -57,8 +61,16 @@ class VideoAssembler {
     for (let i = 1; i < idxs.length; i++) if (idxs[i] !== idxs[i - 1] + 1) return; // hole
     if (idxs[idxs.length - 1] !== f.end) return;
     this.pending.delete(ts);
-    const data = Buffer.concat(idxs.map((i) => { const p = f.parts.get(i); return isFragment(p) ? p.subarray(2) : p; }));
-    this.ready.set(idxs[0], { key: f.key, data, ts, last: f.end, since: this.now() });
+    let data = Buffer.concat(idxs.map((i) => { const p = f.parts.get(i); return isFragment(p) ? p.subarray(2) : p; }));
+    let key = f.key;
+    if (this.group) {
+      const units = nalUnits(data);
+      key = units.some((u) => (u[0] & 0x1f) === 7 || (u[0] & 0x1f) === 5);
+      const kept = units.filter((u) => !SVC_NALS.has(u[0] & 0x1f));
+      if (!kept.length) { this.pending.delete(ts); this.stats.dropped++; return; }
+      if (kept.length !== units.length) data = Buffer.concat(kept.flatMap((u) => [START_CODE, u]));
+    }
+    this.ready.set(idxs[0], { key, data, ts, last: f.end, since: this.now() });
   }
 
   _flush() {
@@ -87,6 +99,22 @@ class VideoAssembler {
     if (fr.key) this.stats.keys++;
     this.onFrame({ key: fr.key, data: fr.data, ts: fr.ts });
   }
+}
+
+const SVC_NALS = new Set([14, 15, 20]);
+const START_CODE = Buffer.from([0, 0, 0, 1]);
+
+// NAL units of an Annex-B buffer (without their start codes).
+function nalUnits(annexB) {
+  const starts = [];
+  for (let i = 0; i + 2 < annexB.length; i++) {
+    if (annexB[i] === 0 && annexB[i + 1] === 0 && annexB[i + 2] === 1) { starts.push(i + 3); i += 2; }
+  }
+  return starts.map((st, k) => {
+    let end = k + 1 < starts.length ? starts[k + 1] - 3 : annexB.length;
+    while (end > st && annexB[end - 1] === 0) end--; // 4-byte start codes and trailing zeros
+    return annexB.subarray(st, end);
+  }).filter((u) => u.length);
 }
 
 function isFragment(p) {
@@ -119,4 +147,4 @@ function packetizeFrame(annexB, maxChunk = MAX_CHUNK) {
   return out;
 }
 
-module.exports = { VideoAssembler, avcCodecString, packetizeFrame, KEY_PT, DELTA_PT: 97 };
+module.exports = { VideoAssembler, avcCodecString, packetizeFrame, nalUnits, KEY_PT, DELTA_PT: 97 };

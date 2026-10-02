@@ -37,6 +37,8 @@ const COMMANDS = {
   ECHO: 5,          // server RTT probe before InitZRTP (payload: decimal seq)
   CHANGE_ADDRESS: 14,
   REQ_FORWARD: 32,  // relayed to the peer via the server; sub 10 ~1/s ping/pong, sub 8 once
+  GROUP_MESSAGE: 33, // group: server -> client, GroupCallController::_handleZRTPReqGroupCallMessage
+  ROOM_UPDATED: 50,  // group: server -> client, CMD_ZAVI_ROOM_UPDATED (u32 UIDs in the room)
   INIT_ZAVI_PING: 0x33,
 };
 
@@ -123,6 +125,63 @@ function buildInitZrtpPacket({
   // 152-byte session, capture 2026-09-30).
   if (extra && extra.length) parts.push(u16String(extra));
   return Buffer.concat(parts);
+}
+
+// Group calls (SFU, port 3000) use the same 21-byte control header. From the
+// x86_64 disassembly of macOS ZaloCall 26.9.10 (docs/GROUP-CALL.md, not yet
+// checked against a capture):
+//  - InitZRTP: initZRTPPacketRequestInitCall(uid, callId, isHost, sessId, ...)
+//    cmd 11 host / 12 others, subCmd 4. _buildPacketInternal writes the
+//    callId/peer slots (+0x38/+0x3c) unless subCmd is 6, and the group init
+//    leaves them 0: payload u32 0, u32 0, u16str session, u16str extra.
+//    extra (_sendRequestInitZRTPAllSelectedServer) is 4 bytes:
+//    [debugLoopback 0, 5, camera off (1), 1].
+//  - Ping: initZRTPPacketRequestInitZaviPing, cmd 0x33 subCmd 1, magic 0x7e,
+//    with the server's token; payload u32 0, u32 0, u16str session,
+//    u16str extra [0, 5, camera off (1)].
+// The first live test (2026-10-01) got a refusal for that layout, so
+// `layout` picks one of the candidates (the backend tries them in turn):
+//   zero        u32 0, u32 0, session, extra                (static reading, subCmd 4)
+//   sub6        subCmd 6: u32 callId, u8 isHost, u8 5, u8 loopback 0, session,
+//               extra — the +0xe4..+0xea fields the group init does fill
+//               (_buildPacketInternal writes them for subCmd 6 only)
+//   callId      u32 callId, u32 0, session, extra           (subCmd 4)
+//   callIdHost  u32 callId, u32 hostCall, session, extra    (subCmd 4)
+function groupExtra(cameraOff = true, initZrtp = true) {
+  const b = [0, 5, cameraOff ? 1 : 0];
+  if (initZrtp) b.push(1);
+  return Buffer.from(b);
+}
+
+const GROUP_INIT_LAYOUTS = ['zero', 'sub6', 'callId', 'callIdHost'];
+
+function buildGroupInitZrtpPacket({ host = false, uid = 0, sessId = '', cameraOff = true, callId = 0, hostCall = 0, layout = 'zero' }) {
+  const header = buildControlHeader({
+    magic: MAGIC_BYTE,
+    uid,
+    cmd: host ? COMMANDS.INIT_CALL_CALLER : COMMANDS.INIT_CALL_CALLEE,
+    subCmd: layout === 'sub6' ? 0x06 : 0x04,
+  });
+  const extra = u16String(groupExtra(cameraOff, true));
+  if (layout === 'sub6') return Buffer.concat([header, u32(callId), Buffer.from([host ? 1 : 0, 5, 0]), u16String(sessId), extra]);
+  const a = layout === 'zero' ? 0 : callId;
+  const b = layout === 'callIdHost' ? hostCall : 0;
+  return Buffer.concat([header, u32(a), u32(b), u16String(sessId), extra]);
+}
+
+function buildZaviPingPacket({ uid = 0, token = 0, sessId = '', cameraOff = true }) {
+  const header = buildControlHeader({ magic: MAGIC_BYTE, uid, token, cmd: COMMANDS.INIT_ZAVI_PING, subCmd: 0x01 });
+  return Buffer.concat([header, u32(0), u32(0), u16String(sessId), u16String(groupExtra(cameraOff, false))]);
+}
+
+// CMD_ZAVI_ROOM_UPDATED (MsgType 2 cmd 50, header UID = ours): u32 LE UID of
+// everyone in the room (handleZRTPPacket rejects a length that is not a
+// multiple of 4).
+function parseRoomUpdated(data) {
+  if (!Buffer.isBuffer(data) || data.length % 4) return null;
+  const out = [];
+  for (let o = 0; o < data.length; o += 4) out.push(data.readUInt32LE(o));
+  return out;
 }
 
 function buildPingPacket({ uid = 0, token = 0, sessId = '' }) {
@@ -239,14 +298,17 @@ function unwrapPacket(buf) {
       data,
     };
     const initCmd = parsed.cmd === COMMANDS.INIT_CALL_CALLER || parsed.cmd === COMMANDS.INIT_CALL_CALLEE;
-    if (initCmd && msgType === MSG_TYPES.SERVER_REPLY && data.length >= 14) {
+    if (initCmd && msgType === MSG_TYPES.SERVER_REPLY && data.length >= 4) {
       // Server answer to InitZRTP: result, callId, the token for media
       // headers, and our address as the server sees it ("ip|port").
+      // A refusal is the result alone (_parsePacketInternal stops there).
       parsed.res = data.readUInt32LE(0);
-      parsed.callId = data.readUInt32LE(4);
-      parsed.serverToken = data.readUInt32LE(8);
-      const n = data.readUInt16LE(12);
-      parsed.publicAddr = data.slice(14, 14 + n).toString('latin1');
+      if (parsed.res === 0 && data.length >= 14) {
+        parsed.callId = data.readUInt32LE(4);
+        parsed.serverToken = data.readUInt32LE(8);
+        const n = data.readUInt16LE(12);
+        parsed.publicAddr = data.slice(14, 14 + n).toString('latin1');
+      }
     } else if (initCmd && data.length >= 10) {
       parsed.callId = data.readUInt32LE(0);
       parsed.peerUid = data.readUInt32LE(4);
@@ -286,6 +348,10 @@ module.exports = {
   wrapMediaPacket,
   buildControlHeader,
   buildInitZrtpPacket,
+  buildGroupInitZrtpPacket,
+  GROUP_INIT_LAYOUTS,
+  buildZaviPingPacket,
+  parseRoomUpdated,
   buildPingPacket,
   buildEndCallPacket,
   buildReqForwardPacket,

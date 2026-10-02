@@ -27,6 +27,9 @@
 
 const { VideoAssembler, avcCodecString } = require('./video');
 
+// A group ping error ends the call only after this long without media.
+const GROUP_MEDIA_IDLE_MS = 10000;
+
 const CODEC = '[{"dynamicFptime":0,"frmPtime":20,"name":"opus/16000/1","payload":112}]\n';
 
 // JsonCpp writes keys sorted and ends with a newline; mirror that.
@@ -62,8 +65,11 @@ const noUi = { open() {}, status() {}, close() {}, onHangup() {}, incoming() {} 
 
 class EngineCore {
   // emit(frame) sends one engine->zalo frame: { type, command, data }.
-  constructor({ emit, media = new MediaBackend(), log = () => {}, ui = noUi }) {
+  // group: answer incoming group calls (experimental, ZCALL_GROUP=1);
+  // otherwise the call window says they are not supported.
+  constructor({ emit, media = new MediaBackend(), log = () => {}, ui = noUi, group = false }) {
     this.emit = emit;
+    this.groupEnabled = !!group;
     this.media = media;
     this.log = log;
     this.ui = ui;
@@ -71,7 +77,10 @@ class EngineCore {
     this.local = {};
     this.ui.onHangup(() => this.hangup('local'));
     if (typeof this.ui.onMute === 'function') {
-      this.ui.onMute((on) => { this.media.setMute(on); this._micState(!on); });
+      this.ui.onMute((on) => {
+        this.media.setMute(on);
+        if (this.call && this.call.group) { this.call.muted = on; this._groupBroadcast(); } else this._micState(!on);
+      });
     }
     // Device picked in the call window (or the saved choice, sent when the window connects).
     if (typeof this.ui.onDevice === 'function') {
@@ -87,7 +96,10 @@ class EngineCore {
     if (typeof media.on === 'function') {
       media.on('timeout', () => this.hangup('media-timeout'));
       media.on('failed', (why) => this.hangup(`media-${why}`));
-      media.on('peerEnd', () => this._peerEnded('server'));
+      media.on('peerEnd', (why) => (this.call && this.call.group ? this._groupEnded(why || 'server') : this._peerEnded('server')));
+      media.on('roster', (uids) => this._groupRoster(uids));
+      media.on('memberLeft', (uid) => this._groupMemberLeft(uid, 'server'));
+      media.on('memberAudio', (uid) => this._groupMemberIn(uid));
       media.on('video', (pkt) => this._onVideoPacket(pkt));
       media.on('keyframe', (why) => this._requestKeyFrame(why));
     }
@@ -135,6 +147,7 @@ class EngineCore {
     // type 1 voice, 3 video; 5 / 6 the same for a group (with groupInfo).
     if (data.type === 5 || data.type === 6 || data.groupInfo) {
       const g = data.groupInfo || {};
+      if (this.groupEnabled) { this._groupOutgoing(data); return; }
       this.emit({ type: 'response', command: 'show', data: { error: 0, extendData: 'success' } });
       this.emit({ type: 'update', command: 'callState', data: { state: 'free' } });
       this._groupNotSupported(g.name || g.groupName || 'Gọi nhóm', g.avatar || '');
@@ -220,7 +233,8 @@ class EngineCore {
     const c = this.call;
     const d = data.data || {};
     if (typeof act === 'string' && act.startsWith('group_')) {
-      if (act === 'group_request') this._incomingGroup(d);
+      if (this.groupEnabled) this._onGroupControl(act, d);
+      else if (act === 'group_request') this._incomingGroup(d);
       return;
     }
     switch (act) {
@@ -382,6 +396,22 @@ class EngineCore {
   _onVideoPacket(pkt) {
     const c = this.call;
     if (!c || c.state !== 'connected' || typeof this.ui.video !== 'function') return;
+    if (c.group) {
+      // One stream per member: the window shows one tile per src (UID).
+      if (!c.videos) c.videos = new Map();
+      let v = c.videos.get(pkt.ssrc);
+      if (!v) {
+        v = { codec: null };
+        v.asm = new VideoAssembler((f) => {
+          if (f.key) v.codec = avcCodecString(f.data) || v.codec;
+          if (!v.codec) return;
+          this.ui.video({ key: f.key, codec: v.codec, data: f.data, src: pkt.ssrc });
+        }, undefined, { group: true });
+        c.videos.set(pkt.ssrc, v);
+      }
+      v.asm.push(pkt);
+      return;
+    }
     if (!c.video) {
       c.video = new VideoAssembler((f) => {
         if (f.key) c.videoCodec = avcCodecString(f.data) || c.videoCodec;
@@ -434,6 +464,35 @@ class EngineCore {
           this._send416(c, chosen, best && best.publicAddr);
         });
         return;
+      // Zalo's answer to our group ping. An error ("uid invalid timestamp",
+      // error -1) means our account is no longer in the call, e.g. it hung up
+      // on another device: ZCallGroupInfo::receiveResponsePing ends the call
+      // ("ping fail"). Live test 2026-10-01: started right after the phone,
+      // on the same account, left.
+      case '12433': // answer to our group call request: servers + session
+        if (c && c.group && c.role === 'caller' && c.state === 'calling') this._groupRequestAnswered(data);
+        return;
+      case '12434':
+      case '12437':
+        if (c && c.group) this.log(`recvSignal ${command}`, JSON.stringify(parseMaybeJson(data.params || data.data)).slice(0, 300));
+        return;
+      case '12097': {
+        if (!c || !c.group || c.state !== 'connected') return;
+        const r = parseMaybeJson(data.data);
+        // -3 "List incall empty": nobody in the call yet, normal while our
+        // own call is still ringing (live test 2026-10-01).
+        if (Number(r.error) === -3 && c.role === 'caller' && !c.answered) return;
+        if (r.error !== undefined && Number(r.error) !== 0) {
+          // A ping error alone is not enough: "uid invalid timestamp" also
+          // came 36 s into a call whose audio and video kept flowing (live
+          // test 2026-10-01). End only once the media stopped too.
+          const idle = this.media.lastRxAt ? Date.now() - this.media.lastRxAt : Infinity;
+          if (idle < GROUP_MEDIA_IDLE_MS) { this.log('group ping fail:', r.error, r.message || '', '(media still flowing; staying)'); return; }
+          this.log('group ping fail:', r.error, r.message || '');
+          this._groupFinish(50, 'Cuộc gọi nhóm đã kết thúc', { signals: true });
+        }
+        return;
+      }
       case '409': // ack of our 409/405 (the call is already finished then)
       case '405':
         if (c && c.state !== 'ended') this._peerEnded(`recvSignal ${command}`);
@@ -504,6 +563,7 @@ class EngineCore {
     const c = this.call;
     if (!c || c.state === 'ended') return;
     this.log('hangup:', why);
+    if (c.group) { this._groupHangup(why); return; }
     if (c.state === 'incoming') { this.reject(why); return; }
     if (c.state === 'connected') {
       this.emit({ type: 'sendSignal', command: 409, data: { callId: c.callId, toId: c.peerId } });
@@ -511,6 +571,434 @@ class EngineCore {
       this.emit({ type: 'sendSignal', command: 405, data: { callId: c.callId, callType: c.type === 3 ? 1 : 0, status: 0, toId: c.peerId } });
     }
     this._finish(c.state === 'connected' ? 50 : 103);
+  }
+
+  // ---- Group calls (incoming, audio only; docs/GROUP-CALL.md) ----
+  // Signals as ZCallGroupInfo / ZMessageSerializer build them (macOS ZaloCall
+  // 26.9.10): every one carries callId and hostCall, the rest in a JsonCpp
+  // string `data`, which is what Zalo's JS destructures.
+  //   control group_request -> callState incall, 12439 ringring
+  //   answer   -> group InitZRTP to callSetting.servers, then 12436 status 0,
+  //               12098 broadcast, 12097 ping every `interval`
+  //   decline  -> 12436 status 3
+  //   hang up  -> 12438 endcall, 12446 finish, callState free
+  // The callee never sends 12434 (only the caller does: ZCallGroupInfo +0x9b0).
+
+  _onGroupControl(act, d) {
+    const c = this.call;
+    if (act === 'group_request') return this._groupIncoming(d);
+    if (!c || !c.group) return;
+    const id = d.id !== undefined ? d.id : d.callId;
+    if (id !== undefined && Number(id) !== c.callId) return; // another group call
+    const who = Number(d.userId || d.fromId) || 0;
+    switch (act) {
+      case 'group_broadcast': // member state, sent every few seconds
+        if (who && who !== c.localUid) this._groupMember(who, { state: Number(d.callState) === 3 ? 'incall' : 'ringing', muted: Number(d.audioState) === 1 });
+        return;
+      case 'group_answer':
+        if (who && who !== c.localUid) this._groupMember(who, { state: 'incall' });
+        return;
+      // fromId = the member being rung, receiverId = us (log 2026-10-01).
+      case 'group_ring_ring':
+        if (who && who !== c.localUid && !(c.members.get(who) || {}).state) this._groupMember(who, { state: 'ringing' });
+        return;
+      case 'group_end_call':
+      case 'group_cancel':
+        // Not answered yet: the caller gave up, or our account answered /
+        // declined on another device (fromId = our UID).
+        if (c.state === 'incoming' && (!who || who === c.hostCall || who === c.localUid)) {
+          this.log('group call over before we answered:', act, who === c.localUid ? 'handled on another device' : 'cancelled');
+          this._groupFinish(0, 'Cuộc gọi nhóm đã kết thúc', { signals: false });
+          return;
+        }
+        // In the call: Zalo says we left (the server dropped us, or it is the
+        // echo of our own 12438, which then finds the call already over).
+        if (who === c.localUid) {
+          this.log('group call: Zalo reports our own end_call');
+          this._groupFinish(c.state === 'connected' ? 50 : 0, 'Cuộc gọi nhóm đã kết thúc', { signals: false });
+          return;
+        }
+        if (who) this._groupMemberLeft(who, act);
+        return;
+      default:
+        this.log('group control', act);
+    }
+  }
+
+  // ---- Outgoing group call (ZCallGroupInfo::requestCall) ----
+  //   makeCall type 5 / 6 + groupInfo -> 12433 requestCallGroup
+  //   recvSignal 12433 (callSetting: servers, session) -> InitZRTP as host (cmd 11)
+  //   -> 12434 (our server + session; Zalo rings the members), 12098, 12097
+  //   nobody answers in RING_TIMEOUT -> 12437 cancel; hang up -> 12438 + 12446
+  _groupOutgoing(data) {
+    const g = data.groupInfo || {};
+    const ids = (Array.isArray(data.partner) ? data.partner : []).map((p) => String(p.id || '')).filter(Boolean);
+    this.call = {
+      group: true,
+      role: 'caller',
+      state: 'calling',
+      callId: newCallId(),
+      hostCall: 0,
+      groupIdStr: String(g.id || ''),
+      groupId: 0,
+      localUid: 0,
+      callType: data.type === 6 ? 1 : 0,
+      sessId: '',
+      servers: [],
+      config: {},
+      title: g.name || g.groupName || 'Cuộc gọi nhóm',
+      avatar: g.avatar || '',
+      maxUsers: Number(g.maxUsers) || 8,
+      invited: ids,
+      inviteNames: (data.partner || []).map((p) => p.name || ''),
+      members: new Map(),
+      pingMs: 9000,
+      startedAt: 0,
+      muted: false,
+    };
+    const c = this.call;
+    this.log(`outgoing group call ${c.callId}: ${ids.length} member(s)`);
+    this.emit({ type: 'update', command: 'callState', data: { state: 'incall' } });
+    this.emit({ type: 'response', command: 'show', data: { error: 0, extendData: 'success' } });
+    // ZMessageSerializer::requestCallGroup: typeRequest from the constant 6
+    // (6 -> 1), partners and data.noiseId = the invited Zalo ids, as JsonCpp strings.
+    this.emit({
+      type: 'sendSignal',
+      command: 12433,
+      data: {
+        callId: c.callId,
+        data: jsonCpp({ extraData: '', groupAvatar: c.avatar, groupId: c.groupIdStr, groupName: c.title, maxUsers: c.maxUsers, noiseId: jsonCpp(ids) }),
+        groupId: c.groupIdStr,
+        partners: jsonCpp(ids),
+        typeRequest: 1,
+      },
+    });
+    this.ui.open({ title: c.title, text: 'Đang gọi nhóm…', avatar: c.avatar });
+    c.ringTimer = setTimeout(() => {
+      if (this.call === c && !c.answered && c.state !== 'ended') { this.log('group call: nobody answered'); this._groupHangup('no-answer'); }
+    }, Number(process.env.ZCALL_GROUP_RING_MS) || 60000);
+    if (c.ringTimer.unref) c.ringTimer.unref();
+  }
+
+  // recvSignal 12433 (_parseRequestCallResponseGroupDetail: callId,
+  // callSetting, session, groupId, maxUsers, status, msg, failedId, ...).
+  _groupRequestAnswered(data) {
+    const c = this.call;
+    const p = { ...parseMaybeJson(data.data), ...parseMaybeJson(data.params) };
+    const setting = parseMaybeJson(p.callSetting);
+    this.log('group call request answered:', JSON.stringify({ keys: Object.keys(p), status: p.status, msg: p.msg, settingKeys: Object.keys(setting) }));
+    const status = Number(p.status !== undefined ? p.status : data.status) || 0;
+    c.hostCall = Number(data.hostCall || p.hostCall) || 0;
+    c.localUid = c.hostCall;
+    if (p.callId) c.callId = Number(p.callId);
+    if (p.groupId && Number(p.groupId) < 0x7fffffff) c.groupId = Number(p.groupId);
+    if (p.interval) c.pingMs = Number(p.interval) < 1000 ? Number(p.interval) * 1000 : Number(p.interval);
+    c.sessId = setting.session || p.session || '';
+    c.servers = Array.isArray(setting.servers) ? setting.servers : [];
+    c.config = parseMaybeJson(setting.zrtcConfig);
+    if (status !== 0 || !c.sessId || !c.servers.length || !c.localUid) {
+      this.log('group call request refused / incomplete');
+      c.state = 'failed';
+      this.ui.status(p.msg ? `Không gọi được: ${p.msg}` : 'Không gọi được nhóm');
+      setTimeout(() => this._groupFinish(0, 'Không gọi được nhóm', { signals: false }), 3000).unref();
+      return;
+    }
+    c.state = 'connecting';
+    this.media.onNegotiated({
+      group: true,
+      host: true,
+      servers: c.servers,
+      config: c.config,
+      sessId: c.sessId,
+      callId: c.callId,
+      role: 'caller',
+      localUid: c.localUid,
+      hostCall: c.hostCall,
+    });
+    this.media.prepare('caller').then((best) => {
+      if (this.call !== c || c.state !== 'connecting') return;
+      if (!best && this.media.sendUdp) {
+        c.state = 'failed';
+        this.ui.status('Không vào được cuộc gọi nhóm (máy chủ từ chối)');
+        setTimeout(() => this._groupFinish(0, 'Không vào được cuộc gọi nhóm', { signals: false }), 3000).unref();
+        return;
+      }
+      this.media.start('caller', null);
+      c.state = 'connected';
+      c.startedAt = Date.now();
+      const srv = (best && best.server && best.server.raw) || c.servers[0] || {};
+      // ZMessageSerializer::sendRequestZRtpCallGroup, values as
+      // ZCallGroupInfo::onCallJoinMeetingSuccess passes them.
+      this.emit({
+        type: 'sendSignal',
+        command: 12434,
+        data: {
+          callId: c.callId,
+          callType: c.callType,
+          data: jsonCpp({
+            codec: '',
+            data: jsonCpp({ groupAvatar: c.avatar, groupName: c.title, hostCall: c.hostCall, maxUsers: c.maxUsers, noiseId: c.invited }),
+            extendData: '',
+            rtcpAddress: srv.rtcpaddr || '',
+            rtcpAddressIPv6: srv.rtcpaddrIPv6 || srv.rtcpIPv6 || '',
+            rtpAddress: srv.rtpaddr || '',
+            rtpAddressIPv6: srv.rtpaddrIPv6 || srv.rtpIPv6 || '',
+          }),
+          groupId: c.groupIdStr,
+          // Added by the same helper as in 12433 (requestCallGroup+0x840):
+          // the people Zalo rings. Without it nobody rang (live test 2026-10-01).
+          partners: jsonCpp(c.invited),
+          session: c.sessId,
+        },
+      });
+      this._groupBroadcast();
+      c.pingTimer = setInterval(() => this._groupPing(), c.pingMs);
+      if (c.pingTimer.unref) c.pingTimer.unref();
+      this.ui.status('Đang đổ chuông…', 0);
+    });
+  }
+
+  _groupIncoming(d) {
+    if (this.call) { this.log('group call while in a call; ignored', d.id); return; }
+    this.groupNotice = null;
+    const setting = parseMaybeJson(d.callSetting);
+    const localUid = Number(d.receiverId) || 0;
+    const members = new Map();
+    for (const p of Array.isArray(d.partnerInfo) ? d.partnerInfo : []) {
+      const uid = Number(p.userId) || 0;
+      if (!uid || uid === localUid) continue;
+      members.set(uid, { name: p.name || '', state: Number(p.callState) === 3 ? 'incall' : 'ringing', muted: Number(p.audioState) === 1 });
+    }
+    const interval = Number(d.interval) || 0;
+    this.call = {
+      group: true,
+      role: 'callee',
+      state: 'incoming',
+      callId: Number(d.id),
+      hostCall: Number(d.hostCall) || 0,
+      groupId: Number(d.groupId) || 0,
+      localUid,
+      callType: Number(d.callType) === 1 ? 1 : 0,
+      sessId: setting.session || d.session || '',
+      servers: Array.isArray(setting.servers) ? setting.servers : [],
+      config: parseMaybeJson(setting.zrtcConfig),
+      title: d.groupName || 'Cuộc gọi nhóm',
+      avatar: d.groupAvatar || '',
+      members,
+      // 12097 period; `interval` unit not known (seconds if small).
+      pingMs: interval ? (interval < 1000 ? interval * 1000 : interval) : 10000,
+      startedAt: 0,
+      muted: false,
+    };
+    const c = this.call;
+    this.log(`incoming group call ${c.callId}: ${c.servers.length} server(s), ${members.size} member(s), session ${c.sessId.length} chars`);
+    if (!c.sessId || !c.servers.length || !c.localUid) {
+      this.log('group_request without session / servers / receiverId; not answering');
+      this.call = null;
+      this._incomingGroup(d);
+      return;
+    }
+    this.emit({ type: 'update', command: 'callState', data: { state: 'incall' } });
+    this.emit({ type: 'sendSignal', command: 12439, data: { callId: c.callId, data: jsonCpp({ callType: 1, extraData: '', status: 1 }), hostCall: c.hostCall, session: c.sessId, status: 1 } });
+    const host = (c.members.get(c.hostCall) || {}).name || d.Dname || 'Ai đó';
+    this.ui.incoming({ title: c.title, text: `${host} đang gọi nhóm (chỉ có tiếng)`, avatar: c.avatar },
+      () => this._groupAnswer(), (why) => this._groupReject(why));
+  }
+
+  _groupAnswer() {
+    const c = this.call;
+    if (!c || !c.group || c.state !== 'incoming') return;
+    c.state = 'connecting';
+    this.media.onNegotiated({
+      group: true,
+      host: false,
+      servers: c.servers,
+      config: c.config,
+      srtpMode: c.config.srtpMode,
+      sessId: c.sessId,
+      callId: c.callId,
+      role: 'callee',
+      localUid: c.localUid,
+      hostCall: c.hostCall,
+    });
+    this.ui.status('Đang kết nối…');
+    this.media.prepare('callee').then((best) => {
+      if (this.call !== c || c.state !== 'connecting') return;
+      if (!best && this.media.sendUdp) {
+        // Leave the reason on screen for a moment before the window closes.
+        c.state = 'failed';
+        this.ui.status('Không vào được cuộc gọi nhóm (máy chủ từ chối)');
+        this._groupSendAnswer(c, 3);
+        setTimeout(() => this._groupFinish(0, 'Không vào được cuộc gọi nhóm', { signals: false }), 3000).unref();
+        return;
+      }
+      this.media.start('callee', null);
+      c.state = 'connected';
+      c.startedAt = Date.now();
+      this._groupSendAnswer(c, 0);
+      this._groupBroadcast();
+      c.pingTimer = setInterval(() => this._groupPing(), c.pingMs);
+      if (c.pingTimer.unref) c.pingTimer.unref();
+      this._groupStatus();
+    });
+  }
+
+  _groupReject(why = 'reject') {
+    const c = this.call;
+    if (!c || !c.group || c.state !== 'incoming') return;
+    this.log('group reject:', why);
+    this._groupSendAnswer(c, 3);
+    this._groupFinish(0, 'Đã từ chối cuộc gọi nhóm', { signals: false });
+  }
+
+  // 12436: status 0 accept, 3 decline (ZCallGroupInfo::_trySendAcceptSignal / _rejectCurrentCall).
+  _groupSendAnswer(c, status) {
+    this.emit({
+      type: 'sendSignal',
+      command: 12436,
+      data: {
+        callId: c.callId,
+        data: jsonCpp({ callType: c.callType, codec: '', extendData: '', groupId: c.groupId, status }),
+        hostCall: c.hostCall,
+        session: c.sessId,
+        status,
+      },
+    });
+  }
+
+  _groupState(c) {
+    return { audioState: c.muted ? 1 : 0, callId: c.callId, callState: 3, hostCall: c.hostCall, userId: c.localUid, videoState: 0 };
+  }
+
+  _groupBroadcast() {
+    const c = this.call;
+    if (c && c.group && c.state === 'connected') this.emit({ type: 'sendSignal', command: 12098, data: this._groupState(c) });
+  }
+
+  _groupPing() {
+    const c = this.call;
+    if (c && c.group && c.state === 'connected') this.emit({ type: 'sendSignal', command: 12097, data: this._groupState(c) });
+  }
+
+  _groupMember(uid, info) {
+    const c = this.call;
+    if (!c || !c.group || uid === c.localUid) return;
+    const m = c.members.get(uid) || { name: '' };
+    c.members.set(uid, { ...m, ...info });
+    if (info.state === 'incall') c.answered = true;
+    this._groupStatus();
+  }
+
+  _groupMemberIn(uid) {
+    const c = this.call;
+    if (c && c.group && uid !== c.localUid && (c.members.get(uid) || {}).state !== 'incall') this._groupMember(uid, { state: 'incall' });
+  }
+
+  // The server's list of who is in the room (cmd 50).
+  _groupRoster(uids) {
+    const c = this.call;
+    if (!c || !c.group) return;
+    const inRoom = new Set(uids);
+    for (const uid of inRoom) if (uid !== c.localUid) this._groupMember(uid, { state: 'incall' });
+    for (const [uid, m] of c.members) if (m.state === 'incall' && !inRoom.has(uid)) c.members.set(uid, { ...m, state: 'left' });
+    this._groupStatus();
+    this._groupCheckEmpty('roster');
+  }
+
+  _groupMemberLeft(uid, why) {
+    const c = this.call;
+    if (!c || !c.group || uid === c.localUid) return;
+    const m = c.members.get(uid);
+    if (!m || m.state === 'left') return;
+    this.log('group member left:', uid, why);
+    c.members.set(uid, { ...m, state: 'left' });
+    this._groupStatus();
+    this._groupCheckEmpty(why);
+  }
+
+  // Everyone else gone: the real engine ends the call (_countIncallPartner).
+  _groupCheckEmpty(why) {
+    const c = this.call;
+    if (!c || !c.group || c.state !== 'connected') return;
+    const others = [...c.members.values()].filter((m) => m.state === 'incall' || m.state === 'ringing');
+    if (!others.length) { this.log('group call: nobody left', why); this._groupHangup('alone'); }
+  }
+
+  _groupStatus() {
+    const c = this.call;
+    if (!c || !c.group || c.state !== 'connected') return;
+    const names = [...c.members.values()].filter((m) => m.state === 'incall').map((m) => m.name || 'Thành viên');
+    const waiting = c.role === 'caller' && !c.answered ? 'Đang đổ chuông…' : 'Đang chờ người khác…';
+    const text = names.length ? `${names.length + 1} người: Bạn, ${names.join(', ')}` : waiting;
+    if (text !== c.statusText) { c.statusText = text; this.ui.status(text, c.startedAt); }
+  }
+
+  // The server removed us (host ended the meeting, or kicked us).
+  _groupEnded(why) {
+    const c = this.call;
+    if (!c || !c.group || c.state === 'ended') return;
+    this.log('group call ended by the server:', why);
+    this._groupFinish(c.state === 'connected' ? 50 : 0, why === 'kicked' ? 'Bạn đã bị mời ra khỏi cuộc gọi' : 'Cuộc gọi nhóm đã kết thúc');
+  }
+
+  _groupHangup(why) {
+    const c = this.call;
+    if (!c || c.state === 'ended') return;
+    if (c.state === 'incoming') { this._groupReject(why); return; }
+    if (c.role === 'caller' && !c.answered) { this._groupCancel(why); return; }
+    this._groupFinish(c.state === 'connected' ? 50 : 0, null);
+  }
+
+  // Caller gives up before anyone answered: 12437 {callId, hostCall,
+  // data {callType, duration, extraData, groupId}} (ZCallGroupInfo::_cancelCurrentCall).
+  _groupCancel(why) {
+    const c = this.call;
+    this.log('group call cancelled:', why);
+    if (c.hostCall) {
+      this.emit({
+        type: 'sendSignal',
+        command: 12437,
+        data: { callId: c.callId, data: jsonCpp({ callType: c.callType, duration: 0, extraData: '', groupId: c.groupId }), hostCall: c.hostCall },
+      });
+    }
+    this._groupFinish(0, why === 'no-answer' ? 'Không ai trả lời' : 'Đã huỷ cuộc gọi nhóm', { signals: false });
+  }
+
+  // 12438 endcall {callId, hostCall, data {callType, duration, extraData,
+  // groupId, status}} (status 7 for reasons 19-23, else 0), then 12446.
+  _groupFinish(status, closeText, { signals = true } = {}) {
+    const c = this.call;
+    if (!c || c.state === 'ended') return;
+    const connected = c.state === 'connected';
+    c.state = 'ended';
+    clearInterval(c.pingTimer);
+    clearTimeout(c.ringTimer);
+    const stats = (connected && this.media.stats()) || {};
+    this.media.stop();
+    const duration = connected ? Math.round((Date.now() - c.startedAt) / 1000) : 0;
+    if (signals && connected) {
+      this.emit({
+        type: 'sendSignal',
+        command: 12438,
+        data: { callId: c.callId, data: jsonCpp({ callType: c.callType, duration, extraData: '', groupId: c.groupId, status: 0 }), hostCall: c.hostCall },
+      });
+      this.emit({
+        type: 'sendSignal',
+        command: 12446,
+        data: {
+          callId: c.callId,
+          callType: c.callType,
+          data: JSON.stringify({ Codec: ['opus/16000/1', '20'], RxTotalPkt: stats.rx || 0, TxTotalPkt: stats.tx || 0, sysInfo: 'native-engine' }),
+          duration,
+          hostCall: c.hostCall,
+          joinTime: c.startedAt,
+          status,
+        },
+      });
+    }
+    this.emit({ type: 'update', command: 'callState', data: { state: 'free' } });
+    this.ui.close(closeText || (connected ? `Kết thúc — ${duration} s` : 'Đã kết thúc'));
+    this.call = null;
   }
 
   _finish(status, closeText) {

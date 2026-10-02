@@ -9,7 +9,8 @@
  *
  *   engine -> ui  {type:"state", phase, name, avatar, text, since, video, muted,
  *                  speakerOff, peerCamOff, peerMuted, peerSharing}
- *                 {type:"video", key, codec, data}   one received H.264 frame (Annex-B, base64)
+ *                 {type:"video", key, codec, data, src?}   one received H.264 frame (Annex-B, base64);
+ *                                                   src: the group member (one tile each)
  *                 {type:"keyframe"}                  the phone needs a key frame
  *                 {type:"close", text}
  *   ui -> engine  {action:"hangup"|"accept"|"reject"|"mute"|"speaker"|"camera", on?}
@@ -392,6 +393,10 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
   body.is-video .camb{display:flex!important}
   #video{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;background:#000;display:none;z-index:0}
   body.has-video #video{display:block}
+  #grid{position:fixed;inset:0;display:none;gap:2px;background:#000;z-index:0;grid-auto-rows:1fr}
+  body.has-grid #grid{display:grid}
+  body.has-grid #video{display:none}
+  #grid canvas{width:100%;height:100%;min-height:0;object-fit:cover;background:#111}
   body.has-video .avatar{display:none}
   body.has-video .top,body.has-video h1,body.has-video .status,body.has-video .timer,body.has-video .notes,body.has-video .buttons{position:relative;z-index:1}
   body.has-video h1{margin-top:auto;margin-top:18px;color:#fff;text-shadow:0 1px 3px #000a}
@@ -436,6 +441,7 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
   .hide{display:none!important}
 </style></head><body>
   <canvas id="video"></canvas>
+  <div id="grid"></div>
   <canvas id="self"></canvas>
   <div class="top"><span class="tag" id="tag">Cuộc gọi video</span>
     <span class="wctl"><button id="compactBtn" title="Thu gọn">${svg('compact')}</button><button id="minBtn" title="Thu nhỏ xuống thanh tác vụ">${svg('minimize')}</button></span></div>
@@ -516,7 +522,7 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
   ipcRenderer.on('zcall-ui-state', (_e, s) => {
     state = s || {};
     if (state.phase !== 'connected') {
-      stopVideo(); stopLocal(); sharing = false;
+      stopVideo(); stopTiles(); stopLocal(); sharing = false;
       if (pendingScreen) { pendingScreen.stop(); pendingScreen = null; }
     }
     else if (state.video && camOn && !local && !sharing) startLocal();
@@ -726,8 +732,58 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
     // Software: the hardware path refuses these streams on this Electron.
     dec.configure({ codec, optimizeForLatency: true, hardwareAcceleration: 'prefer-software' });
   }
+  // Group calls: one tile per member (m.src), each with its own decoder.
+  // A tile with no frame for 5 s goes away (camera off, member left).
+  const grid = $('grid'); const tiles = new Map();
+  function layoutTiles() {
+    const n = tiles.size;
+    grid.style.gridTemplateColumns = 'repeat(' + Math.max(1, Math.ceil(Math.sqrt(n))) + ',1fr)';
+    document.body.classList.toggle('has-grid', n > 0);
+    document.body.classList.toggle('has-video', n > 0 || (dec && document.body.classList.contains('has-video')));
+  }
+  function dropTile(src) {
+    const t = tiles.get(src);
+    if (!t) return;
+    if (t.dec && t.dec.state !== 'closed') try { t.dec.close(); } catch (_) {}
+    t.cv.remove(); tiles.delete(src);
+  }
+  function stopTiles() { for (const src of [...tiles.keys()]) dropTile(src); layoutTiles(); }
+  setInterval(() => {
+    let changed = false;
+    for (const [src, t] of tiles) if (Date.now() - t.last > 5000) { dropTile(src); changed = true; }
+    if (changed) layoutTiles();
+  }, 1000);
+  function tileFrame(m) {
+    let t = tiles.get(m.src);
+    if (!t) {
+      if (!m.key) return; // a decoder starts on a key frame
+      const cv = document.createElement('canvas');
+      grid.appendChild(cv);
+      t = { cv, g: cv.getContext('2d'), dec: null, codec: null, ts: 0, last: Date.now() };
+      tiles.set(m.src, t);
+      layoutTiles();
+    }
+    t.last = Date.now();
+    if (m.key && (!t.dec || t.dec.state === 'closed' || m.codec !== t.codec)) {
+      if (t.dec && t.dec.state !== 'closed') try { t.dec.close(); } catch (_) {}
+      t.codec = m.codec;
+      t.dec = new VideoDecoder({
+        output: (f) => {
+          if (t.cv.width !== f.displayWidth || t.cv.height !== f.displayHeight) { t.cv.width = f.displayWidth; t.cv.height = f.displayHeight; }
+          t.g.drawImage(f, 0, 0); f.close();
+        },
+        error: () => { t.dec = null; },
+      });
+      t.dec.configure({ codec: m.codec, optimizeForLatency: true, hardwareAcceleration: 'prefer-software' });
+    }
+    if (!t.dec || t.dec.state !== 'configured') return;
+    const bin = atob(m.data); const data = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) data[i] = bin.charCodeAt(i);
+    try { t.dec.decode(new EncodedVideoChunk({ type: m.key ? 'key' : 'delta', timestamp: t.ts += 66666, data })); } catch (_) { t.dec = null; }
+  }
   ipcRenderer.on('zcall-ui-video', (_e, m) => {
     if (state.phase !== 'connected') return;
+    if (m.src !== undefined && m.src !== null) { tileFrame(m); return; }
     if (m.key && (!dec || dec.state === 'closed' || m.codec !== decCodec)) newDecoder(m.codec);
     if (!dec || dec.state !== 'configured') return;
     const bin = atob(m.data); const data = new Uint8Array(bin.length);

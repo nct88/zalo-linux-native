@@ -15,6 +15,7 @@ Framing on the pipes (big endian):
 Stops when stdin closes. Logs go to stderr.
 
   --tone   send a 440 Hz tone instead of the microphone (for tests)
+  --mix    group call: one jitter buffer per source (src = SSRC), mixed every 20 ms
   --mic / --speaker   PulseAudio source / sink to use (else ZCALL_MIC / ZCALL_SPEAKER, else the default)
 
 With PipeWire the microphone goes through WebRTC audio processing (echo
@@ -37,6 +38,8 @@ import struct
 import subprocess
 import sys
 import threading
+from array import array
+from collections import Counter, deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -247,6 +250,106 @@ class Processing:
             self.conf = None
 
 
+class _FrameQueue:
+    """Sink stand-in for one source of the Mixer: keeps decoded 20 ms frames."""
+
+    def __init__(self):
+        self.frames = deque()
+
+    def write(self, pcm: bytes):
+        # Opus may hand back more than one frame (a longer packet): split it.
+        for o in range(0, len(pcm) - FRAME_BYTES + 1, FRAME_BYTES):
+            self.frames.append(pcm[o:o + FRAME_BYTES])
+
+
+class Mixer:
+    """Group calls: one jitter buffer and Opus decoder per source (SSRC = the
+    member's UID), summed every 20 ms on our own clock, as the real engine's
+    OutputMixer does. Same push / flush / stats as OpusJitter."""
+
+    PREBUFFER = 2   # frames a source needs before it is played
+    MAX_QUEUE = 10  # frames kept per source; older ones are dropped (latency)
+    IDLE_SEC = 5    # a source that sent nothing for this long is forgotten
+
+    def __init__(self, sink: Sink, depth: int = 10):
+        self.sink = sink
+        self.depth = depth
+        self.sources = {}  # src -> [OpusJitter, _FrameQueue, last packet time, playing]
+        self.lock = threading.Lock()
+        self.stats = Counter()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._clock, daemon=True)
+        self.thread.start()
+
+    def push(self, idx: int, payload: bytes, source=None):
+        with self.lock:
+            s = self.sources.get(source)
+            if s is None:
+                q = _FrameQueue()
+                s = self.sources[source] = [OpusJitter(q, max_plc=5, depth=self.depth), q, 0.0, False]
+                log(f"mixer: new source {source}")
+            s[2] = time.monotonic()
+            s[0].push(idx, payload)
+
+    def _mix(self):
+        now = time.monotonic()
+        out = None
+        with self.lock:
+            for src in list(self.sources):
+                s = self.sources[src]
+                q = s[1].frames
+                if now - s[2] > self.IDLE_SEC and not q:
+                    for k, v in s[0].stats.items():
+                        self.stats[k] += v
+                    del self.sources[src]
+                    log(f"mixer: source {src} gone")
+                    continue
+                while len(q) > self.MAX_QUEUE:
+                    q.popleft()
+                    self.stats["dropped"] += 1
+                if not s[3]:
+                    if len(q) < self.PREBUFFER:
+                        continue
+                    s[3] = True
+                if not q:
+                    s[3] = False  # ran dry: build up the prebuffer again
+                    self.stats["underrun"] += 1
+                    continue
+                frame = array("h", q.popleft())
+                if out is None:
+                    out = frame
+                else:
+                    for i in range(FRAME):
+                        v = out[i] + frame[i]
+                        out[i] = 32767 if v > 32767 else -32768 if v < -32768 else v
+        self.stats["mixed"] += 1
+        return out.tobytes() if out is not None else bytes(FRAME_BYTES)
+
+    def _clock(self):
+        nxt = time.monotonic()
+        while not self.stop.is_set():
+            pcm = self._mix()
+            try:
+                self.sink.write(pcm)
+            except (BrokenPipeError, ValueError, OSError):
+                return
+            nxt += 0.02
+            delay = nxt - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            elif delay < -0.2:
+                nxt = time.monotonic()  # fell behind (suspend, load): start over
+
+    def flush(self):
+        self.stop.set()
+        self.thread.join(timeout=1)
+        with self.lock:
+            for s in self.sources.values():
+                for k, v in s[0].stats.items():
+                    self.stats[k] += v
+            self.sources.clear()
+
+
 def read_exact(fh, n: int) -> bytes | None:
     out = bytearray()
     while len(out) < n:
@@ -319,6 +422,7 @@ def main():
     ap.add_argument("--device", help="ALSA device (default: PulseAudio if running)")
     ap.add_argument("--out", type=Path, help="write received audio to this file instead of playing")
     ap.add_argument("--tone", action="store_true", help="send a 440 Hz tone instead of the microphone")
+    ap.add_argument("--mix", action="store_true", help="group call: decode every source and mix them")
     ap.add_argument("--no-mic", action="store_true", help="receive only")
     ap.add_argument("--mic", default=os.environ.get("ZCALL_MIC"), help="PulseAudio source")
     ap.add_argument("--speaker", default=os.environ.get("ZCALL_SPEAKER"), help="PulseAudio sink")
@@ -338,7 +442,7 @@ def main():
     speaker_name = proc.sink if processed else chosen["speaker"]
     player = " ".join(shlex.quote(a) for a in speaker_command(speaker_name)) if pulse else None
     sink = Sink(args.out, player, args.device)
-    jitter = OpusJitter(sink, max_plc=5, depth=args.jitter)
+    jitter = Mixer(sink, depth=args.jitter) if args.mix else OpusJitter(sink, max_plc=5, depth=args.jitter)
     muted = threading.Event()
     out = os.fdopen(sys.stdout.fileno(), "wb", buffering=0)
     lock = threading.Lock()

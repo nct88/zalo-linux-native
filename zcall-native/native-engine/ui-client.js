@@ -74,8 +74,9 @@ class ElectronCallUi {
   }
 
   // One received video frame (H.264 Annex-B): the window decodes and shows it.
-  video({ key, codec, data }) {
-    this._send({ type: 'video', key, codec, data: data.toString('base64') });
+  // src: the member (group calls, one tile each); absent in 1-1 calls.
+  video({ key, codec, data, src }) {
+    this._send({ type: 'video', key, codec, data: data.toString('base64'), src });
   }
 
   close(text) {
