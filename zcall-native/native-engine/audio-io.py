@@ -15,13 +15,18 @@ Framing on the pipes (big endian):
 Stops when stdin closes. Logs go to stderr.
 
   --tone   send a 440 Hz tone instead of the microphone (for tests)
+  --mix    group call (several sources); every call has one jitter buffer per
+           source (src = SSRC), decoded and mixed every 20 ms on the sound card's clock
   --mic / --speaker   PulseAudio source / sink to use (else ZCALL_MIC / ZCALL_SPEAKER, else the default)
 
 With PipeWire the microphone goes through WebRTC audio processing (echo
-cancellation, noise suppression, gain control, high-pass filter), as the
-real engine does (zrtc_config audioEchoCancellation / audioNoiseSuppression /
-audioGainControl), and received audio is played through it as the echo
-reference. ZCALL_AUDIO_PROCESSING=0 turns it off.
+cancellation, noise suppression, high-pass filter), as the real engine does
+(zrtc_config audioEchoCancellation / audioNoiseSuppression), and received
+audio is played through it as the echo reference. ZCALL_AUDIO_PROCESSING=0
+turns it off. No gain control: PipeWire's webrtc.gain_control turns on two
+digital AGCs at once (AGC1 adaptive digital + AGC2), which pump the noise up
+and distort loud speech; the real engine uses one analog AGC
+(AgcManagerDirect, the OS microphone volume).
 """
 from __future__ import annotations
 
@@ -37,11 +42,13 @@ import struct
 import subprocess
 import sys
 import threading
+from array import array
+from collections import Counter, deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
-from opus_play import DEFAULT_DEVICE, FRAME, OpusJitter, Sink, load_opus, pulse_running  # noqa: E402
+from opus_play import DEFAULT_DEVICE, FRAME, Sink, load_opus, new_decoder, pulse_running  # noqa: E402
 
 OPUS_APPLICATION_VOIP = 2048
 OPUS_SET_BITRATE = 4002
@@ -139,7 +146,10 @@ class Mic:
 
 
 def switch_speaker(sink, name: str | None):
-    """Play through another PulseAudio sink from now on (Sink from opus_play)."""
+    """Play through another PulseAudio sink from now on (PulseOut, or Sink from opus_play)."""
+    if isinstance(sink, PulseOut):
+        sink.switch(present(name, "sinks"))
+        return
     cmd = speaker_command(present(name, "sinks"))
     log("player:", " ".join(cmd))
     old, sink.proc = sink.proc, subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -164,7 +174,7 @@ context.modules = [
       args = {
         library.name = aec/libspa-aec-webrtc
         aec.args = {
-            webrtc.gain_control = true
+            webrtc.gain_control = false
             webrtc.noise_suppression = true
             webrtc.high_pass_filter = true
             webrtc.extended_filter = true
@@ -247,6 +257,286 @@ class Processing:
             self.conf = None
 
 
+class PulseOut:
+    """Playback through libpulse-simple (PipeWire / PulseAudio). write() blocks
+    until the stream has room, so the playout loop runs on the sound card's
+    clock, as the real engine's AudioDeviceMac render thread pulls 10 ms at a
+    time from NetEq. pacat could not do that: the pipe in front of it holds
+    two seconds, so we had to guess the time with our own clock, and the
+    card's clock drifts away from it (latency grows, or the card runs dry and
+    clicks)."""
+
+    LATENCY_MS = 60
+
+    class _Spec(ctypes.Structure):
+        _fields_ = [("format", ctypes.c_int), ("rate", ctypes.c_uint32), ("channels", ctypes.c_uint8)]
+
+    class _Attr(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint32) for n in ("maxlength", "tlength", "prebuf", "minreq", "fragsize")]
+
+    def __init__(self, device: str | None):
+        lib = ctypes.CDLL("libpulse-simple.so.0")
+        lib.pa_simple_new.restype = ctypes.c_void_p
+        lib.pa_simple_new.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p,
+                                      ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        lib.pa_simple_write.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int)]
+        lib.pa_simple_free.argtypes = [ctypes.c_void_p]
+        self.lib = lib
+        self.lock = threading.Lock()
+        self.s = self._open(device)
+        self.silent = False
+        self.failed = False
+
+    def _open(self, device: str | None):
+        spec = self._Spec(3, 16000, 1)  # PA_SAMPLE_S16LE
+        none = 0xFFFFFFFF
+        attr = self._Attr(none, FRAME_BYTES * self.LATENCY_MS // 20, none, none, none)
+        err = ctypes.c_int(0)
+        s = self.lib.pa_simple_new(None, b"Zalo", 1, device.encode() if device else None, b"Call",  # PA_STREAM_PLAYBACK
+                                   ctypes.byref(spec), None, ctypes.byref(attr), ctypes.byref(err))
+        if not s:
+            raise OSError(f"pa_simple_new failed ({err.value})")
+        log(f"player: libpulse-simple {device or 'default'}, {self.LATENCY_MS} ms")
+        return s
+
+    def switch(self, device: str | None):
+        new = self._open(device)
+        with self.lock:
+            old, self.s = self.s, new
+        self.lib.pa_simple_free(old)
+
+    def write(self, pcm: bytes):
+        if self.silent:
+            pcm = bytes(len(pcm))
+        with self.lock:
+            err = ctypes.c_int(0)
+            ok = self.s and self.lib.pa_simple_write(self.s, pcm, len(pcm), ctypes.byref(err)) >= 0
+        if not ok:
+            # The device went away (processing restarted for another device):
+            # keep time until switch() brings a new stream.
+            if not self.failed:
+                log(f"pa_simple_write failed ({err.value})")
+            self.failed = True
+            time.sleep(0.02)
+        else:
+            self.failed = False
+
+    def close(self):
+        with self.lock:
+            if self.s:
+                self.lib.pa_simple_free(self.s)
+                self.s = None
+
+
+class _Stream:
+    """One received stream (one SSRC), a small NetEq: packets wait undecoded
+    and are decoded when the playout asks for the next 20 ms, so that
+    - a packet not there yet when it is due is waited for with PLC (NetEq's
+      Expand: a late packet still plays, the delay grows); once enough is
+      buffered after it, it is lost and becomes Opus FEC (from the next
+      packet) or PLC in its place, never a gap;
+    - after MAX_EXPAND frames of PLC with nothing to play, it goes quiet and
+      builds up the buffer again;
+    - the buffer depth follows the measured arrival jitter (min..max frames);
+      too much buffered (a burst, or the sender's clock faster than our card)
+      drops a quiet frame now and then, like NetEq's Accelerate.
+    """
+
+    MIN_TARGET = 2
+    START_TARGET = 4      # until the jitter is measured
+    MAX_EXPAND = 5        # 100 ms of PLC before going quiet
+    WINDOW = 250          # arrivals (5 s) used for the jitter estimate
+
+    def __init__(self, opus, max_target: int, stats: Counter):
+        self.opus = opus
+        self.dec = new_decoder(opus)
+        self.buf = ctypes.create_string_buffer(1920 * 2)
+        self.max_target = max(self.MIN_TARGET, max_target)
+        self.stats = stats
+        self.packets = {}     # idx -> Opus payload
+        self.next = None      # idx played next
+        self.playing = False
+        self.expand = 0       # PLC frames in a row
+        self.carry = b""      # rest of a packet longer than 20 ms
+        self.transit = deque(maxlen=self.WINDOW)
+        self.target = self.START_TARGET
+        self.last = time.monotonic()
+        self.since_drop = 0
+
+    def push(self, idx: int, payload: bytes, now: float):
+        self.last = now
+        if self.next is not None and idx < self.next:
+            self.stats["late"] += 1
+            return
+        if idx in self.packets:
+            self.stats["dup"] += 1
+            return
+        self.packets[idx] = payload
+        # Arrival time minus send time (idx * 20 ms) up to a constant: its
+        # spread over the last seconds is the jitter the buffer must absorb.
+        self.transit.append(now - idx * 0.02)
+        if len(self.transit) >= 20:
+            t = sorted(self.transit)
+            spread = t[int(len(t) * 0.95) - 1] - t[0]
+            self.target = min(self.max_target, max(self.MIN_TARGET, math.ceil(spread / 0.02) + 1))
+
+    def _decode(self, payload, fec=False) -> bytes:
+        size = FRAME if fec or not payload else 1920
+        n = self.opus.opus_decode(self.dec, payload, len(payload) if payload else 0, self.buf, size, 1 if fec else 0)
+        if n <= 0:
+            self.stats["opus_fail"] += 1
+            return bytes(FRAME_BYTES)
+        return self.buf.raw[:n * 2]
+
+    def _take(self, pcm: bytes) -> bytes:
+        self.carry = pcm[FRAME_BYTES:]
+        return pcm[:FRAME_BYTES].ljust(FRAME_BYTES, b"\0")
+
+    def pull(self) -> bytes | None:
+        """The next 20 ms, or None (not playing)."""
+        if self.carry:
+            return self._take(self.carry)
+        if not self.playing:
+            if len(self.packets) < self.target:
+                return None
+            self.playing = True
+            first = min(self.packets)
+            if self.next is None or first > self.next:
+                self.next = first
+        self.since_drop += 1
+        if self.next in self.packets:
+            pcm = self._decode(self.packets.pop(self.next))
+            self.next += 1
+            self.expand = 0
+            self.stats["opus_ok"] += 1
+            span = max(self.packets) - self.next + 1 if self.packets else 0
+            # Too much buffered: drop this frame if it is quiet, or any frame
+            # when far too much (after a stall). At most one per 200 ms.
+            if span > self.target + 2 and self.since_drop >= 10 and self.next in self.packets \
+                    and (span > self.target + 8 or _rms(pcm) < 300):
+                self.since_drop = 0
+                self.stats["accelerate"] += 1
+                return self.pull()
+            return self._take(pcm)
+        if self.packets and (len(self.packets) >= self.target or self.expand >= self.MAX_EXPAND):
+            # A hole, and the buffer waited long enough: the packet is lost.
+            self.expand = 0
+            self.stats["lost"] += 1
+            nxt = self.packets.get(self.next + 1)
+            self.next += 1
+            if nxt is not None:
+                self.stats["fec"] += 1
+                return self._take(self._decode(nxt, fec=True))
+            self.stats["plc"] += 1
+            return self._take(self._decode(None))
+        # Not there yet: conceal and wait for it (the delay grows by 20 ms;
+        # Accelerate takes it back later), then go quiet and buffer up again.
+        self.stats["underrun"] += 1
+        if self.expand < self.MAX_EXPAND:
+            self.expand += 1
+            self.stats["plc"] += 1
+            return self._take(self._decode(None))
+        self.expand = 0
+        self.playing = False
+        return None
+
+
+def _rms(pcm: bytes) -> float:
+    a = array("h", pcm)
+    return math.sqrt(sum(v * v for v in a) / len(a)) if a else 0.0
+
+
+class Playout:
+    """Every 20 ms, the next frame of each source (_Stream), summed, as the
+    real engine's OutputMixer + NetEq do (one source in a 1-1 call). With
+    PulseOut the loop is paced by the sound card (blocking writes); with
+    another sink (pacat, aplay, a file) by our own clock."""
+
+    IDLE_SEC = 5    # a source that sent nothing for this long is forgotten
+    REPORT_SEC = 30
+
+    def __init__(self, sink, depth: int = 10):
+        self.sink = sink
+        self.depth = depth
+        self.opus = load_opus()
+        self.sources = {}  # src -> _Stream
+        self.lock = threading.Lock()
+        self.stats = Counter()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._clock, daemon=True)
+        self.thread.start()
+
+    def push(self, idx: int, payload: bytes, source=None):
+        now = time.monotonic()
+        with self.lock:
+            s = self.sources.get(source)
+            if s is None:
+                s = self.sources[source] = _Stream(self.opus, self.depth, self.stats)
+                log(f"playout: new source {source}")
+            s.push(idx, payload, now)
+
+    def _mix(self):
+        now = time.monotonic()
+        out = None
+        with self.lock:
+            for src in list(self.sources):
+                s = self.sources[src]
+                if now - s.last > self.IDLE_SEC and not s.packets:
+                    del self.sources[src]
+                    log(f"playout: source {src} gone")
+                    continue
+                pcm = s.pull()
+                if pcm is None:
+                    continue
+                frame = array("h", pcm)
+                if out is None:
+                    out = frame
+                else:
+                    for i in range(FRAME):
+                        v = out[i] + frame[i]
+                        out[i] = 32767 if v > 32767 else -32768 if v < -32768 else v
+        self.stats["mixed"] += 1
+        return out.tobytes() if out is not None else bytes(FRAME_BYTES)
+
+    def _report(self):
+        with self.lock:
+            targets = {src: s.target * 20 for src, s in self.sources.items()}
+        keys = ("opus_ok", "lost", "fec", "plc", "underrun", "accelerate", "late")
+        log("playout:", {k: self.stats[k] for k in keys if self.stats[k]}, "buffer ms", targets)
+
+    def _clock(self):
+        paced = isinstance(self.sink, PulseOut)
+        nxt = last_report = time.monotonic()
+        while not self.stop.is_set():
+            pcm = self._mix()
+            try:
+                self.sink.write(pcm)
+            except (BrokenPipeError, ValueError, OSError) as e:
+                log("playout stopped:", e)
+                return
+            now = time.monotonic()
+            if now - last_report >= self.REPORT_SEC:
+                last_report = now
+                self._report()
+            if paced:
+                continue
+            nxt += 0.02
+            delay = nxt - now
+            if delay > 0:
+                time.sleep(delay)
+            elif delay < -0.2:
+                nxt = time.monotonic()  # fell behind (suspend, load): start over
+
+    def flush(self):
+        self.stop.set()
+        self.thread.join(timeout=1)
+        with self.lock:
+            self.sources.clear()
+
+
+Mixer = Playout  # older name (tests)
+
+
 def read_exact(fh, n: int) -> bytes | None:
     out = bytearray()
     while len(out) < n:
@@ -319,6 +609,7 @@ def main():
     ap.add_argument("--device", help="ALSA device (default: PulseAudio if running)")
     ap.add_argument("--out", type=Path, help="write received audio to this file instead of playing")
     ap.add_argument("--tone", action="store_true", help="send a 440 Hz tone instead of the microphone")
+    ap.add_argument("--mix", action="store_true", help="group call: decode every source and mix them")
     ap.add_argument("--no-mic", action="store_true", help="receive only")
     ap.add_argument("--mic", default=os.environ.get("ZCALL_MIC"), help="PulseAudio source")
     ap.add_argument("--speaker", default=os.environ.get("ZCALL_SPEAKER"), help="PulseAudio sink")
@@ -336,9 +627,17 @@ def main():
 
     processed = start_processing()
     speaker_name = proc.sink if processed else chosen["speaker"]
-    player = " ".join(shlex.quote(a) for a in speaker_command(speaker_name)) if pulse else None
-    sink = Sink(args.out, player, args.device)
-    jitter = OpusJitter(sink, max_plc=5, depth=args.jitter)
+    sink = None
+    if pulse:
+        try:
+            sink = PulseOut(speaker_name)
+        except OSError as e:
+            log("libpulse-simple unavailable, using pacat:", e)
+    if sink is None:
+        player = " ".join(shlex.quote(a) for a in speaker_command(speaker_name)) if pulse else None
+        sink = Sink(args.out, player, args.device)
+    # 1-1 and group calls alike (--mix only says several sources are expected).
+    jitter = Playout(sink, depth=args.jitter)
     muted = threading.Event()
     out = os.fdopen(sys.stdout.fileno(), "wb", buffering=0)
     lock = threading.Lock()
