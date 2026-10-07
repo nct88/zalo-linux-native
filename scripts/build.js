@@ -23,6 +23,30 @@ function readJson(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
+function jsFiles(dir) {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    const p = path.join(dir, e.name);
+    return e.isDirectory() ? jsFiles(p) : (p.endsWith('.js') ? [p] : []);
+  });
+}
+
+// electron-builder's extraFiles filter decides what zcall-native/ ships. The
+// engine dies at startup if a file it requires was filtered out, so check the
+// packaged copy: every relative require resolves, and audio-io.py's opus_play.
+function checkEnginePackaged(dir) {
+  const missing = [];
+  for (const file of jsFiles(dir)) {
+    const src = fs.readFileSync(file, 'utf8');
+    for (const m of src.matchAll(/require\((['"])(\.{1,2}\/[^'"]+)\1\)/g)) {
+      try { require.resolve(path.resolve(path.dirname(file), m[2])); } catch (_) {
+        missing.push(`${path.relative(dir, file)} requires ${m[2]}`);
+      }
+    }
+  }
+  if (!fs.existsSync(path.join(dir, 'tools', 'opus_play.py'))) missing.push('audio-io.py imports tools/opus_play.py');
+  if (missing.length) throw new Error('call engine incomplete in the package: ' + missing.join('; '));
+}
+
 async function main() {
   const version = readJson(path.join(BASE_DIR, 'package.json')).version;
   const zaloVersion = readJson(path.join(APP_DIR, 'package.json.bak')).version;
@@ -46,10 +70,14 @@ async function main() {
     JSON.stringify({ version, zaloVersion, commit, buildDate: new Date().toISOString() }, null, 2));
 
   const stage2 = path.join(BASE_DIR, 'scripts', 'build-stage2.sh');
-  execSync([
+  execSync(
     `npx electron-builder --linux --config.linux.artifactName="${name}" -c.extraMetadata.version=${zaloVersion} --publish=never`,
-    `bash "${stage2}" "${version}" "${name}" "${DIST_DIR}"`
-  ].join(' && '), { cwd: BASE_DIR, stdio: 'inherit' });
+    { cwd: BASE_DIR, stdio: 'inherit' });
+  const unpacked = fs.readdirSync(DIST_DIR).filter((d) => /^linux(-arm64)?-unpacked$/.test(d));
+  if (!unpacked.length) throw new Error('electron-builder output (linux-unpacked) not found in dist/');
+  for (const d of unpacked) checkEnginePackaged(path.join(DIST_DIR, d, 'zcall-native'));
+  logger.success('call engine files are all in the package');
+  execSync(`bash "${stage2}" "${version}" "${name}" "${DIST_DIR}"`, { cwd: BASE_DIR, stdio: 'inherit' });
 
   const file = path.join(DIST_DIR, name);
   if (!fs.existsSync(file)) throw new Error(`${name} not found in dist/`);

@@ -76,7 +76,6 @@
         "to": "zcall-native",
         "filter": [
           "**/*",
-          "!tools{,/**/*}",
           "!**/__pycache__/**",
           "!**/*.pyc"
         ]
