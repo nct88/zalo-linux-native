@@ -21,11 +21,11 @@ const MSG_TYPES = {
   SERVER_REPLY: 0x02,   // server -> client answer to a control request (InitZRTP, cmd 32)
   AUDIO_RTP: 0x03,       // client → server, 5-byte hdr + RTP PT 112 (wire 2026-09-29)
   AUDIO_RTP_DOWN: 0x04,  // server → client (observed; not in macOS 0xa0a8 bitmask)
-  AUDIO_FEC: 0x05,
+  AUDIO_FEC: 0x05,     // the name is old: captures show RTCP audio (transport-cc, SR), plain; native-engine/rtcp.js
   AUDIO_RTCP: 0x07,
   VIDEO_RTP: 0x0d,
   VIDEO_DOWN: 0x0e,      // server → client (observed)
-  VIDEO_FEC: 0x0f,
+  VIDEO_FEC: 0x0f,     // likewise RTCP video (SR / RR, NACK, PLI)
   P2P_EXT: 0x7f,
 };
 
@@ -366,6 +366,11 @@ function wrapP2pVideo({ role, callId, rtp }) {
   return Buffer.concat([p2pHeader(role, callId, P2P.VIDEO), rtp]);
 }
 
+// RTCP over P2P (kind 7 audio, 9 video): plain compound packets, no SRTCP.
+function wrapP2pRtcp({ role, callId, video, rtcp }) {
+  return Buffer.concat([p2pHeader(role, callId, video ? P2P.VIDEO_RTCP : P2P.AUDIO_RTCP), rtcp]);
+}
+
 function unwrapPacket(buf) {
   if (!Buffer.isBuffer(buf) || buf.length < 1) return null;
   const msgType = buf[0];
@@ -467,5 +472,6 @@ module.exports = {
   buildP2pPong,
   wrapP2pAudio,
   wrapP2pVideo,
+  wrapP2pRtcp,
   unwrapPacket,
 };

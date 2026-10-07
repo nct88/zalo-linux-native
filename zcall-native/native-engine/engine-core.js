@@ -99,6 +99,8 @@ class EngineCore {
     }
     if (typeof this.ui.onCamera === 'function') this.ui.onCamera((on) => this._camMic(on));
     if (typeof this.ui.onScreen === 'function') this.ui.onScreen((on) => this._screenShare(on));
+    if (typeof this.ui.onTile === 'function') this.ui.onTile((src, width) => { if (this.call && this.call.group && this.media.setMemberRenderWidth) this.media.setMemberRenderWidth(src, width); });
+    if (typeof this.ui.onNeedKey === 'function') this.ui.onNeedKey((why) => this._askPeerKey('window ' + why));
     if (typeof media.on === 'function') {
       media.on('timeout', () => this.hangup('media-timeout'));
       media.on('failed', (why) => this.hangup(`media-${why}`));
@@ -428,6 +430,38 @@ class EngineCore {
     this.ui.requestKeyFrame();
   }
 
+  // The picture from the phone is damaged (a hole in the stream, a decoder error):
+  // ask it for a key frame (RTCP PLI; the backend limits this to one a second).
+  _askPeerKey(why) {
+    const c = this.call;
+    if (!c || c.state !== 'connected' || c.group || typeof this.media.requestPeerKeyFrame !== 'function') return;
+    this.media.requestPeerKeyFrame(why);
+  }
+
+  // A line in the log every 5 s of video: frames handed to the window per second, key frames,
+  // holes. This is what shows whether the phone really sends more after our feedback.
+  _noteVideoRx(c) {
+    const now = Date.now();
+    const v = c.videoRx || (c.videoRx = { since: now, frames: 0, total: 0 });
+    v.frames++; v.total++;
+    if (now - v.since < 5000) return;
+    const s = c.video.stats;
+    this.log(`video rx: ${(v.frames * 1000 / (now - v.since)).toFixed(1)} fps, ${v.total} frames, ${s.keys} key, ${s.gaps} gaps, ${s.dropped} dropped`);
+    v.since = now; v.frames = 0;
+  }
+
+  // Group: the same line per member. Frames the assembler made but could not hand on (no key frame with an
+  // SPS yet) are counted in noCodec: when they grow and nothing shows, that is why.
+  _noteMemberRx(v, uid) {
+    const now = Date.now();
+    if (!v.since) v.since = now;
+    v.frames++;
+    if (now - v.since < 5000) return;
+    const s = v.asm.stats;
+    this.log(`video rx member ${uid}: ${(v.frames * 1000 / (now - v.since)).toFixed(1)} fps, ${s.frames} frames, ${s.keys} key, ${s.gaps} gaps, ${s.dropped} dropped, ${v.noCodec} without codec`);
+    v.since = now; v.frames = 0;
+  }
+
   // Received video packets -> frames -> call window (decoded there with WebCodecs).
   _onVideoPacket(pkt) {
     const c = this.call;
@@ -437,10 +471,11 @@ class EngineCore {
       if (!c.videos) c.videos = new Map();
       let v = c.videos.get(pkt.ssrc);
       if (!v) {
-        v = { codec: null };
+        v = { codec: null, since: 0, frames: 0, noCodec: 0 };
         v.asm = new VideoAssembler((f) => {
           if (f.key) v.codec = avcCodecString(f.data) || v.codec;
-          if (!v.codec) return;
+          if (!v.codec) { v.noCodec++; return; }
+          this._noteMemberRx(v, pkt.ssrc);
           this.ui.video({ key: f.key, codec: v.codec, data: f.data, src: pkt.ssrc });
         }, undefined, { group: true });
         c.videos.set(pkt.ssrc, v);
@@ -451,8 +486,9 @@ class EngineCore {
     if (!c.video) {
       c.video = new VideoAssembler((f) => {
         if (f.key) c.videoCodec = avcCodecString(f.data) || c.videoCodec;
+        this._noteVideoRx(c);
         this.ui.video({ key: f.key, codec: c.videoCodec || 'avc1.64001e', data: f.data });
-      });
+      }, undefined, { onGap: () => this._askPeerKey('gap') });
     }
     c.video.push(pkt);
   }

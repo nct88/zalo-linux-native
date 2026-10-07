@@ -51,17 +51,23 @@ const {
   buildP2pPong,
   wrapP2pAudio,
   wrapP2pVideo,
+  wrapP2pRtcp,
   unwrapPacket,
 } = require('../zrtp-packet');
 const { masterFromSessId, sessionKeys, parseRtp, unprotectRtp, protectRtp } = require('../srtp-aes');
 const { FRAME_SAMPLES, buildAudioRtpHeader, buildGroupVideoRtpHeader } = require('../rtp');
 const { packetizeFrame, KEY_PT, DELTA_PT } = require('../video');
+const { RtcpFeedback } = require('../rtcp');
 
 // Timings of the real engine (captures 2026-09-29).
 const INIT_WAIT_MS = 600;        // all servers answered InitZRTP within ~35 ms
 const INIT_RETRY_MS = 1000;
 const INIT_TRIES = 3;
 const PING_INTERVAL_MS = 6000;   // Ping to the kept server
+const TWCC_INTERVAL_MS = 50; // ZaloCall's cadence (captures 2026-09-29)
+const RTCP_REPORT_INTERVAL_MS = 1000;
+const PLI_MIN_GAP_MS = 1000; // one key frame request per second at most
+const RTCP_LOG_MS = 5000;
 // Group ZaviPing period: the real engine takes it from its config
 // (GroupCallController +0x85c), value not known yet.
 const GROUP_PING_INTERVAL_MS = Number(process.env.ZCALL_GROUP_PING_MS) || 5000;
@@ -136,7 +142,14 @@ class ZrtcMediaBackend extends EventEmitter {
     this.vTx = 0;
     this.vKeySent = false; // the phone shows nothing until our first key frame
     this.groupCameraOn = false; // ZaviPing camera bit, only when ZCALL_GROUP_CAMERA=1
+    this.rtcp = null; // RtcpFeedback, 1-1 calls only (set in onNegotiated)
+    this.audioOctets = 0;
+    this.lastPliAt = 0;
+    this.rtcpLoggedAt = 0;
     this.vidWanted = new Set(); // group members we asked the SFU to send video for
+    this.renderWidth = new Map(); // group: member UID -> width of its tile in pixels, from the window
+    this.vidAsked = new Map(); // group: member UID -> the quality id last requested
+    this.unknownReplies = new Set();
     this.vidQualLogged = false;
     this.vidCfgLogged = false;
     this.keyRequests = 0;  // PLI / FIR from the peer
@@ -183,6 +196,9 @@ class ZrtcMediaBackend extends EventEmitter {
     this.replies = [];
     this.ended.clear();
     this._resetCounters();
+    // 1-1 only: the group SFU's feedback channel is not captured. ZCALL_RTCP=0 turns it off.
+    this.rtcp = !this.group && process.env.ZCALL_RTCP !== '0' && this.params.localUid
+      ? new RtcpFeedback({ localSsrc: this.params.localUid >>> 0 }) : null;
     // After the counter reset: sub 12 is empty when groupcall has no layers.
     this.videoPlan = this.group ? groupVideoPlan(this.params.config) : null;
     this.log('media: negotiated', { servers: this.servers.length, srtpMode: this.params.srtpMode, sendUdp: this.sendUdp });
@@ -331,6 +347,10 @@ class ZrtcMediaBackend extends EventEmitter {
     this._timer(() => {
       if (Date.now() - this.lastRxAt > MEDIA_TIMEOUT_MS) { this.log('media: no audio from peer'); this.emit('timeout'); }
     }, 2000, true);
+    if (this.rtcp) {
+      this._timer(() => this._sendTwcc(), TWCC_INTERVAL_MS, true);
+      this._timer(() => this._sendRtcpReports(), RTCP_REPORT_INTERVAL_MS, true);
+    }
     if (this.audioEnabled) this._startAudio();
     this._p2pStart();
   }
@@ -371,6 +391,9 @@ class ZrtcMediaBackend extends EventEmitter {
       this._onVideo(msg.subarray(P2P.HEADER_LEN));
     } else if (kind === P2P.VIDEO_RTCP && msg.length > P2P.HEADER_LEN) {
       this._onVideoRtcp(msg.subarray(P2P.HEADER_LEN));
+      if (this.rtcp) this.rtcp.onRtcp('video', msg.subarray(P2P.HEADER_LEN), Date.now());
+    } else if (kind === P2P.AUDIO_RTCP && msg.length > P2P.HEADER_LEN) {
+      if (this.rtcp) this.rtcp.onRtcp('audio', msg.subarray(P2P.HEADER_LEN), Date.now());
     } else if (kind === P2P.AUDIO && msg.length > P2P.HEADER_LEN + 12) {
       this.counters.rxP2p++;
       this._p2pUp(from);
@@ -428,7 +451,7 @@ class ZrtcMediaBackend extends EventEmitter {
       if (this.activeServer && this.serverToken) this._sendEndCall(this.activeServer, this.serverToken);
       for (const r of this.replies) this._sendEndCall(r.server, r.token);
     }
-    if (this.startedAt) this.log('media: stopped', JSON.stringify({ ...this.counters, rxTypes: this.rxTypes, video: this.videoStats, videoTx: this.vTx, keyRequests: this.keyRequests, members: Object.fromEntries(this.members), videoMembers: Object.fromEntries(this.videoMembers) }));
+    if (this.startedAt) this.log('media: stopped', JSON.stringify({ ...this.counters, rxTypes: this.rxTypes, video: this.videoStats, videoTx: this.vTx, keyRequests: this.keyRequests, rtcp: this.rtcp ? this.rtcp.counters : undefined, members: Object.fromEntries(this.members), videoMembers: Object.fromEntries(this.videoMembers) }));
     this.startedAt = 0;
     this.active = false;
     this._onInitReply = null;
@@ -511,6 +534,7 @@ class ZrtcMediaBackend extends EventEmitter {
     // Same packet over P2P once the peer reached us: it drops duplicates by seq.
     if (this.p2pPath) this._send(wrapP2pAudio({ role: this.params.role, callId: this.params.callId, rtp }), this.p2pPath, 'P2P audio');
     this.counters.tx++;
+    this.audioOctets += opus.length;
     this.seq = (this.seq + 1) & 0xffff;
     if (this.seq === 0) this.roc++;
     this.ts = (this.ts + FRAME_SAMPLES) >>> 0;
@@ -561,6 +585,48 @@ class ZrtcMediaBackend extends EventEmitter {
       const head = chunks[0].subarray(0, Math.min(8, chunks[0].length)).toString('hex');
       this.log('media: group camera probe: plain H.264, type 13, PT 98/97, ' + ext + ', payload ' + head);
     }
+  }
+
+  // One RTCP compound: relay (MsgType 5 audio / 0x0F video, 5-byte header) and, once the
+  // peer reached us directly, P2P (kind 7 / 9) as well, like the audio and video RTP.
+  _sendRtcp(video, rtcp) {
+    if (!this.active || !this.activeServer || !this.startedAt) return;
+    this._send(wrapMediaPacket({ msgType: video ? MSG_TYPES.VIDEO_FEC : MSG_TYPES.AUDIO_FEC, token: this.serverToken, payload: rtcp }), this.activeServer, 'RTCP');
+    if (this.p2pPath) this._send(wrapP2pRtcp({ role: this.params.role, callId: this.params.callId, video, rtcp }), this.p2pPath, 'P2P RTCP');
+  }
+
+  // Transport-wide feedback for everything the phone sent (audio + video share one
+  // sequence space): what its send-side bandwidth estimator lives on.
+  _sendTwcc() {
+    if (!this.rtcp) return;
+    for (const pk of this.rtcp.twccPackets()) this._sendRtcp(false, pk);
+  }
+
+  _sendRtcpReports() {
+    if (!this.rtcp) return;
+    const now = Date.now();
+    this._sendRtcp(false, this.rtcp.audioReport(now, { rtpTs: this.ts, packets: this.counters.tx, octets: this.audioOctets }));
+    const v = this.rtcp.videoReport(now);
+    if (v) this._sendRtcp(true, v);
+    if (now - this.rtcpLoggedAt >= RTCP_LOG_MS) {
+      this.rtcpLoggedAt = now;
+      const c = this.rtcp.counters;
+      const b = this.rtcp.video.started ? this.rtcp.video.block(now) : null;
+      this.log(`rtcp: sent twcc ${c.twcc}, reports ${c.reports}, pli ${c.pli}` + (b ? `; video from phone: ${this.rtcp.video.received} pkts, lost ${b.cumLost}, jitter ${b.jitter}` : ''));
+    }
+  }
+
+  // Ask the phone for a key frame (the picture broke: a hole in the stream, or the
+  // decoder gave up). PLI on the video RTCP channel, at most once a second.
+  requestPeerKeyFrame(why) {
+    if (!this.rtcp) return;
+    const now = Date.now();
+    if (now - this.lastPliAt < PLI_MIN_GAP_MS) return;
+    const pli = this.rtcp.pli();
+    if (!pli) return;
+    this.lastPliAt = now;
+    this._sendRtcp(true, pli);
+    this.log('rtcp: PLI to the phone (' + why + ')');
   }
 
   _initSocket() {
@@ -617,14 +683,41 @@ class ZrtcMediaBackend extends EventEmitter {
 
   _sendVidQual() {
     if (!this.group || !this.activeServer || !this.vidWanted.size) return;
-    const entries = [...this.vidWanted].map((uid) => ({ uid, qualityId: 0xff }));
+    const entries = [...this.vidWanted].map((uid) => ({ uid, qualityId: this.qualityIdFor(uid) }));
     this._send(buildGroupVidQualReq({
       uid: this.params.localUid || 0, token: this.serverToken, seq: 0, entries,
     }), this.activeServer, 'VidQual');
-    if (!this.vidQualLogged) {
-      this.vidQualLogged = true;
-      this.log(`media: VidQualReq ${entries.length} member(s), qualityId 0xff`);
+    for (const e of entries) {
+      if (this.vidAsked.get(e.uid) === e.qualityId) continue;
+      this.vidAsked.set(e.uid, e.qualityId);
+      this.log(`media: VidQualReq member ${e.uid}: quality id 0x${e.qualityId.toString(16)}` + (this.renderWidth.has(e.uid) ? `, tile ${this.renderWidth.get(e.uid)} px` : ', tile size unknown'));
     }
+  }
+
+  // Which layer of a member to ask the SFU for. macOS GroupCallController::
+  // getVideoQualityIdReceiving(uid, renderWidth) (disassembled 2026-10-07): walk the
+  // partner's layers from the top and take the first whose width <= the tile's width,
+  // layer 0 at the least; id = spatial * 3 + temporal, so the best frame rate of the
+  // chosen size. Without the partner's own table we use the call's (same zrtc_config)
+  // and its narrower side as the width, which a portrait phone camera really has: a
+  // landscape sender gets a layer that is bigger than it needs, never smaller.
+  // 0xff (what the engine always sent before) stays until the window reported the tile.
+  qualityIdFor(uid) {
+    const plan = this.videoPlan;
+    const w = this.renderWidth.get(uid);
+    if (process.env.ZCALL_GROUP_QUALITY === '0' || !plan || !plan.layers.length || !w) return 0xff;
+    let pick = plan.layers[0];
+    for (const L of plan.layers) if (Math.min(L.b, L.c) <= w) pick = L;
+    return pick.id & 0xff;
+  }
+
+  // The window drew (or resized) the tile of this member.
+  setMemberRenderWidth(uid, width) {
+    uid >>>= 0;
+    width = Math.max(0, Math.round(Number(width) || 0));
+    if (!uid || !this.group || this.renderWidth.get(uid) === width) return;
+    this.renderWidth.set(uid, width);
+    if (this.vidWanted.has(uid) && this.qualityIdFor(uid) !== this.vidAsked.get(uid)) this._sendVidQual();
   }
 
   _sendPing() {
@@ -658,7 +751,12 @@ class ZrtcMediaBackend extends EventEmitter {
     }
     // RTCP video (plaintext, 5-byte header): the peer's key frame requests.
     if (msg[0] === MSG_TYPES.VIDEO_FEC && msg.length > 5) {
-      if (this.active && this.startedAt) this._onVideoRtcp(msg.subarray(5));
+      if (this.active && this.startedAt) { this._onVideoRtcp(msg.subarray(5)); if (this.rtcp) this.rtcp.onRtcp('video', msg.subarray(5), Date.now()); }
+      return;
+    }
+    // RTCP audio (plaintext): the phone's SR, whose time our reports echo back (LSR / DLSR).
+    if (msg[0] === MSG_TYPES.AUDIO_FEC && msg.length > 5) {
+      if (this.active && this.startedAt && this.rtcp) this.rtcp.onRtcp('audio', msg.subarray(5), Date.now());
       return;
     }
     const p = unwrapPacket(msg);
@@ -688,6 +786,7 @@ class ZrtcMediaBackend extends EventEmitter {
     }
     if (p.isMedia && p.msgType === MSG_TYPES.AUDIO_RTP_DOWN) this._onAudio(p.payload);
     else if (p.isMedia && p.msgType === MSG_TYPES.VIDEO_DOWN) this._onVideo(p.payload);
+    else if (this.group && !p.isMedia) this._noteUnknownReply(p, msg);
   }
 
   // Compound RTCP: PSFB (206) fmt 1 PLI / fmt 4 FIR aimed at our SSRC (= our UID).
@@ -731,6 +830,7 @@ class ZrtcMediaBackend extends EventEmitter {
     if (!got) { v.bad++; return; }
     tracker.update(seq, roc);
     this.lastRxAt = Date.now();
+    if (this.rtcp) this.rtcp.onRtp('video', rtp, this.lastRxAt);
     if (this.group) {
       // What the group packetization looks like (not captured before):
       // PTs and the first payload bytes, per member.
@@ -768,6 +868,15 @@ class ZrtcMediaBackend extends EventEmitter {
     }
     this.emit('video', { seq, ts, pt, marker, payload: got.opus, roc, ssrc: got.ssrc });
     if (this.group) this._noteVideoMember(got.ssrc);
+  }
+
+  // Group: what else the server sends (the partners' layer tables, the answer to our
+  // quality requests, screen share streams are not captured yet). One line per kind.
+  _noteUnknownReply(p, msg) {
+    const key = `${p.msgType}/${p.cmd}/${p.subCmd}`;
+    if (this.unknownReplies.has(key) || this.unknownReplies.size >= 30) return;
+    this.unknownReplies.add(key);
+    this.log(`media: server reply type ${p.msgType} cmd ${p.cmd} sub ${p.subCmd}, ${msg.length} bytes: ${msg.subarray(0, Math.min(msg.length, 64)).toString('hex')}`);
   }
 
   // GroupCallController::handleZRTPPacket: cmd 50 = the UIDs in the room
@@ -817,6 +926,7 @@ class ZrtcMediaBackend extends EventEmitter {
       this.members.set(got.ssrc, n);
       if (n === 1) { this.log('media: first audio from member', got.ssrc); this.emit('memberAudio', got.ssrc); }
     }
+    if (this.rtcp) this.rtcp.onRtp('audio', rtp, Date.now());
     this.counters.rx++;
     this.counters.rxSecond++;
     this.lastRxAt = Date.now();

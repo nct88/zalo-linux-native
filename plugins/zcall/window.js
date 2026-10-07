@@ -788,11 +788,24 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuá»™c gá»
   // picture stays up.
   const canvas = $('video'); const g = canvas.getContext('2d');
   let dec = null, decCodec = null, ts = 0;
+  let decErrLogged = false, shown = 0, shownSince = 0, shownTotal = 0;
   const tiles = new Map();
+  // 1-1: the decoder broke (or a decode call threw): say so, and ask the phone for a key frame
+  // (the engine sends the PLI), instead of staying on the last picture until the next one.
+  function decoderBroke(why) {
+    dec = null;
+    if (!decErrLogged) { decErrLogged = true; act('log', { text: 'video decode: ' + why }); }
+    act('needkey', { why: 'decoder' });
+  }
   function stopVideo() {
     if (dec && dec.state !== 'closed') try { dec.close(); } catch (_) {}
     dec = null; decCodec = null;
-    for (const t of tiles.values()) if (t.dec && t.dec.state !== 'closed') try { t.dec.close(); } catch (_) {}
+    decErrLogged = false; shown = 0; shownSince = 0; shownTotal = 0;
+    for (const t of tiles.values()) {
+      if (t.dec && t.dec.state !== 'closed') try { t.dec.close(); } catch (_) {}
+      if (t.ro) t.ro.disconnect();
+      if (t.rt) clearTimeout(t.rt);
+    }
     tiles.clear();
     $('stage').textContent = '';
     $('stage').className = '';
@@ -808,11 +821,21 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuá»™c gá»
     decCodec = codec;
     dec = new VideoDecoder({
       output: (f) => {
-        if (canvas.width !== f.displayWidth || canvas.height !== f.displayHeight) { canvas.width = f.displayWidth; canvas.height = f.displayHeight; }
-        g.drawImage(f, 0, 0); f.close();
+        if (canvas.width !== f.displayWidth || canvas.height !== f.displayHeight) {
+          canvas.width = f.displayWidth; canvas.height = f.displayHeight;
+          act('log', { text: 'video ' + f.displayWidth + 'x' + f.displayHeight });
+        }
+        g.drawImage(f, 0, 0);
+        const now = Date.now(); shown++; shownTotal++;
+        if (!shownSince) shownSince = now;
+        if (now - shownSince >= 5000) {
+          act('log', { text: 'video shown ' + (shown * 1000 / (now - shownSince)).toFixed(1) + ' fps, ' + f.displayWidth + 'x' + f.displayHeight + ', ' + shownTotal + ' frames' });
+          shown = 0; shownSince = now;
+        }
+        f.close();
         if (!state.peerCamOff) document.body.classList.add('has-video');
       },
-      error: () => { dec = null; }, // wait for the next key frame
+      error: (e) => decoderBroke((e && e.message) || String(e)), // the next key frame restarts it
     });
     // Software: the hardware path refuses these streams on this Electron.
     dec.configure({ codec, optimizeForLatency: true, hardwareAcceleration: 'prefer-software' });
@@ -822,8 +845,18 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuá»™c gá»
     if (!t) {
       const c = document.createElement('canvas');
       $('stage').appendChild(c);
-      t = { canvas: c, g: c.getContext('2d'), dec: null, codec: null, ts: 0, logged: false, errLogged: false };
+      t = { canvas: c, g: c.getContext('2d'), dec: null, codec: null, ts: 0, logged: false, errLogged: false, sentW: 0, ro: null, rt: 0 };
       tiles.set(m.src, t);
+      // The engine asks the server for the layer that fits this tile (macOS does the same
+      // from the tile's render width): tell it the width in pixels, and again when it changes.
+      const src = m.src;
+      const reportWidth = () => {
+        t.rt = 0;
+        const w = Math.round(c.getBoundingClientRect().width * (window.devicePixelRatio || 1));
+        if (w > 0 && w !== t.sentW) { t.sentW = w; act('tile', { src, width: w }); }
+      };
+      t.ro = new ResizeObserver(() => { if (!t.rt) t.rt = setTimeout(reportWidth, 300); });
+      t.ro.observe(c);
       const n = Math.min(tiles.size, 4);
       $('stage').className = 'n' + n;
       document.body.classList.add('has-video', 'has-tiles');
@@ -838,7 +871,14 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuá»™c gá»
             t.canvas.width = f.displayWidth; t.canvas.height = f.displayHeight;
             if (!t.logged) { t.logged = true; act('log', { text: 'video ' + src + ' ' + f.displayWidth + 'x' + f.displayHeight }); }
           }
-          t.g.drawImage(f, 0, 0); f.close();
+          t.g.drawImage(f, 0, 0);
+          const now = Date.now(); t.shown = (t.shown || 0) + 1;
+          if (!t.shownSince) t.shownSince = now;
+          if (now - t.shownSince >= 5000) {
+            act('log', { text: 'video shown ' + src + ' ' + (t.shown * 1000 / (now - t.shownSince)).toFixed(1) + ' fps, ' + f.displayWidth + 'x' + f.displayHeight });
+            t.shown = 0; t.shownSince = now;
+          }
+          f.close();
           document.body.classList.add('has-video', 'has-tiles');
         },
         error: (e) => {
@@ -860,7 +900,7 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuá»™c gá»
     if (m.src) { showMember(m); return; }
     if (m.key && (!dec || dec.state === 'closed' || m.codec !== decCodec)) newDecoder(m.codec);
     if (!dec || dec.state !== 'configured') return;
-    try { dec.decode(new EncodedVideoChunk({ type: m.key ? 'key' : 'delta', timestamp: ts += 66666, data: annexB(m) })); } catch (_) { dec = null; }
+    try { dec.decode(new EncodedVideoChunk({ type: m.key ? 'key' : 'delta', timestamp: ts += 66666, data: annexB(m) })); } catch (e) { decoderBroke((e && e.message) || String(e)); }
   });
   ipcRenderer.on('zcall-ui-keyframe', () => { forceKey = true; });
 

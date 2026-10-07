@@ -13,6 +13,8 @@
 //                 {action:"device", kind:"mic"|"speaker", id}   PulseAudio source / sink ("" = default)
 //                 {action:"screen", on}               our screen replaces the camera
 //                 {action:"log", text}                a line for the engine log
+//                 {action:"tile", src, width}        group: a member's tile is this wide (pixels)
+//                 {action:"needkey", why}            the decoder broke: PLI to the phone
 
 const net = require('net');
 const { CallWindow } = require('./call-window');
@@ -39,6 +41,8 @@ class ElectronCallUi {
   onCamera(cb) { this.cb.camera = cb; }
   onDevice(cb) { this.cb.device = cb; }
   onScreen(cb) { this.cb.screen = cb; }
+  onNeedKey(cb) { this.cb.needKey = cb; }
+  onTile(cb) { this.cb.tile = cb; }
 
   open({ title, text, avatar, video = false }) {
     this.incomingCb = null;
@@ -138,6 +142,12 @@ class ElectronCallUi {
         return;
       case 'screen':
         this.cb.screen(!!m.on);
+        return;
+      case 'tile': // group: the window drew the tile of member src at this many pixels wide
+        if (this.cb.tile) this.cb.tile(Number(m.src) >>> 0, Number(m.width) || 0);
+        return;
+      case 'needkey': // the window's decoder gave up: ask the phone for a key frame
+        if (this.cb.needKey) this.cb.needKey(String(m.why || 'decoder').slice(0, 40));
         return;
       case 'log':
         this.log('window:', String(m.text || '').slice(0, 300));

@@ -26,8 +26,11 @@ class VideoAssembler {
   // group: any PT (the group packetization is not captured yet), key frames
   // told by their NAL units (SPS / IDR), and the H.264 SVC units (14 prefix,
   // 15 subset SPS, 20 extension) dropped so the base layer decodes as AVC.
-  constructor(onFrame, now = () => Date.now(), { group = false } = {}) {
+  // onGap: a frame went out with packets missing before it (the picture is
+  // damaged until the next key frame): the caller asks the phone for one.
+  constructor(onFrame, now = () => Date.now(), { group = false, onGap = null } = {}) {
     this.onFrame = onFrame; // ({ key, data, ts })
+    this.onGap = onGap;
     this.now = now;
     this.group = group;
     this.pending = new Map(); // ts -> { parts: Map(idx -> payload), key, end }
@@ -108,6 +111,7 @@ class VideoAssembler {
       if (!this.started && !oldest.key) { this.ready.delete(firstIdx); this.stats.dropped++; continue; }
       if (this.lastIdx >= 0) {
         this.stats.gaps++;
+        if (this.onGap) this.onGap();
         // 1-1 key frames are rare, so a hole is decoded through. Group keys
         // arrive about once a second; feeding the broken delta makes
         // WebCodecs error and then sit on the last picture.
