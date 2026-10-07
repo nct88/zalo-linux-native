@@ -179,6 +179,11 @@ async function extractAppAsar() {
 
   logger.info('Applying platform patches...');
   for (const name of PATCHES) await require(`./patches/${name}`).main();
+
+  const mainJs = path.join(APP_DIR, 'main-dist', 'main.js');
+  if (!fs.existsSync(mainJs) || !fs.readFileSync(mainJs, 'utf8').includes('ZCALL_ENGINE_JS')) {
+    throw new Error('native call patch missing from app/main-dist/main.js');
+  }
 }
 
 function commandExists(command) {

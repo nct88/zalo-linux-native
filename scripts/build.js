@@ -31,6 +31,17 @@ async function main() {
   const name = `Zalo-Linux-Native-${version}-${arch}.AppImage`;
   logger.info(`Building ${name} (Zalo ${zaloVersion}, commit ${commit})`);
 
+  const mainJs = path.join(APP_DIR, 'main-dist', 'main.js');
+  if (!fs.existsSync(mainJs) || !fs.readFileSync(mainJs, 'utf8').includes('ZCALL_ENGINE_JS')) {
+    throw new Error('native call patch missing from app/main-dist/main.js; refusing to package');
+  }
+  const sqliteArch = process.arch === 'arm64' ? 'arm64' : 'x64';
+  const sqlite = path.join(APP_DIR, 'native', 'nativelibs', 'sqlite3', 'binding',
+    `napi-v6-linux-${sqliteArch}`, 'node_sqlite3.node');
+  if (!fs.existsSync(sqlite)) {
+    throw new Error('sqlite3 linux binding missing: ' + sqlite);
+  }
+
   fs.writeFileSync(path.join(APP_DIR, 'pc-dist', 'build-info.json'),
     JSON.stringify({ version, zaloVersion, commit, buildDate: new Date().toISOString() }, null, 2));
 

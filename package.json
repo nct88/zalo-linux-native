@@ -55,12 +55,31 @@
         "filter": [
           "**/*",
           "!node_modules",
-          "!package-lock.json"
+          "!package-lock.json",
+          "!package.json.bak",
+          "!**/darwin/**",
+          "!**/darwin-*/**",
+          "!**/darwin_*/**",
+          "!**/napi-v6-darwin-*/**",
+          "!**/*.dylib",
+          "!**/*mac.node",
+          "!**/win32/**",
+          "!**/win64/**",
+          "!**/ia32/**",
+          "!**/file-utils/x64/**",
+          "!**/__pycache__/**",
+          "!**/*.pyc"
         ]
       },
       {
         "from": "zcall-native",
-        "to": "zcall-native"
+        "to": "zcall-native",
+        "filter": [
+          "**/*",
+          "!tools{,/**/*}",
+          "!**/__pycache__/**",
+          "!**/*.pyc"
+        ]
       }
     ],
     "asarUnpack": [

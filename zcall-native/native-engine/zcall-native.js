@@ -10,6 +10,9 @@
 //   --media stub   signalling only, no media (default; ZCALL_MEDIA)
 //   --media zrtc   Zalo relay media; packets leave the machine only with
 //                  --send-udp (ZCALL_SEND_UDP=1)
+//   --group        answer incoming group calls (ZCALL_GROUP=1).
+//                  ZCALL_GROUP_CAMERA=1 also sends our H.264 as plain RTP.
+//                  Experimental; see docs/GROUP-CALL.md.
 //
 // Zalo-Linux's patched main process spawns it on its own Electron
 // (ELECTRON_RUN_AS_NODE) with the ports and a fresh token. It writes
@@ -35,6 +38,8 @@ const sendPort = Number(opt('send', 29632)); // zalo -> engine
 const mediaMode = opt('media', process.env.ZCALL_MEDIA || 'stub');
 const sendUdp = args.includes('--send-udp') || process.env.ZCALL_SEND_UDP === '1';
 const verbose = args.includes('--verbose') || !!process.env.ZCALL_VERBOSE;
+// Answer incoming group calls (experimental, audio only): --group or ZCALL_GROUP=1.
+const group = args.includes('--group') || process.env.ZCALL_GROUP === '1';
 if (!token) { console.error('need --token <TK> (the value Zalo passes on the command line)'); process.exit(2); }
 
 const key = loadKey();
@@ -47,7 +52,7 @@ const log = (...a) => {
   if (logFile) logFile.write(line + '\n'); else console.error(line);
 };
 process.on('uncaughtException', (e) => { log('uncaught', e.stack || e); process.exit(1); });
-log(`start: media=${mediaMode} sendUdp=${sendUdp} ports ${recvPort}/${sendPort}`);
+log(`start: media=${mediaMode} sendUdp=${sendUdp} group=${group} ports ${recvPort}/${sendPort}`);
 
 // recv socket: we write engine->zalo frames here.
 const recv = net.connect({ host: '127.0.0.1', port: recvPort }, () => recv.write(token + '\n'));
@@ -72,12 +77,15 @@ const media = mediaMode === 'stub' ? new StubMedia(log) : new ZrtcMediaBackend({
 const headless = { open() {}, status() {}, close() {}, onHangup() {},
   incoming(_o, accept) { if (process.env.ZCALL_AUTO_ANSWER) setTimeout(accept, 100); } };
 const ui = args.includes('--no-window') ? headless : createCallUi(log);
-const engine = new EngineCore({ emit, media, log, ui });
+const engine = new EngineCore({ emit, media, log, ui, group });
 
 const parser = new FrameParser(key, { expectToken: false }, (f) => {
   if (f.error) return log('bad frame', f.error);
   if (f.json && typeof f.json === 'object') {
-    log('<-', brief(f.json), verbose ? JSON.stringify(f.json.data).slice(0, 4000) : '');
+    // group_request is ~8 KB (callSetting, zrtcConfig): keep group_* whole.
+    const act = f.json.data && f.json.data.act;
+    const limit = typeof act === 'string' && act.startsWith('group_') ? 65536 : 4000;
+    log('<-', brief(f.json), verbose ? JSON.stringify(f.json.data).slice(0, limit) : '');
     try { engine.onZaloFrame(f.json); } catch (e) { log('engine error', e.stack); }
   }
 });

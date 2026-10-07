@@ -8,7 +8,7 @@
  * the engine's first line is the token. Then one JSON object per line:
  *
  *   engine -> ui  {type:"state", phase, name, avatar, text, since, video, muted,
- *                  speakerOff, peerCamOff, peerMuted, peerSharing}
+ *                  speakerOff, peerCamOff, peerMuted, peerSharing, cameraEncode?}
  *                 {type:"video", key, codec, data}   one received H.264 frame (Annex-B, base64)
  *                 {type:"keyframe"}                  the phone needs a key frame
  *                 {type:"close", text}
@@ -19,10 +19,13 @@
  *
  * phase: outgoing | incoming | connecting | connected | ended.
  *
- * Video: the camera is encoded with WebCodecs (H.264 baseline, 15 fps, at
- * most 640 px, key frame every 2 s or when the engine asks). With
- * ZCALL_TEST_VIDEO=1 and no camera, a moving test pattern is sent instead.
- * Sharing the screen replaces the camera (10 fps, at most 1280 px).
+ * Video: the 1-1 camera is encoded with WebCodecs (H.264 baseline, 15 fps, at
+ * most 640 px, key frame every 2 s or when the engine asks). A group call
+ * sends cameraEncode (layer 0): that exact width, height, bitrate, fps and
+ * key interval, letterboxed in software. Capture stays 640x360; asking the
+ * device for 480x240 stalled the preview. With ZCALL_TEST_VIDEO=1 and no
+ * camera, a moving test pattern is sent instead. Sharing the screen replaces
+ * the camera (10 fps, at most 1280 px) and ignores cameraEncode.
  *
  * Devices: the chevron on Micro / Camera / Loa picks the device, also during
  * a call. Microphones and speakers come from PipeWire (pactl), cameras from
@@ -392,6 +395,13 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
   body.is-video .camb{display:flex!important}
   #video{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;background:#000;display:none;z-index:0}
   body.has-video #video{display:block}
+  body.has-tiles #video{display:none!important}
+  #stage{position:fixed;inset:0;z-index:0;display:none;background:#000;gap:2px}
+  body.has-tiles #stage{display:grid}
+  #stage.n1{grid-template-columns:1fr;grid-template-rows:1fr}
+  #stage.n2{grid-template-columns:1fr;grid-template-rows:1fr 1fr}
+  #stage.n3,#stage.n4{grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr}
+  #stage canvas{width:100%;height:100%;object-fit:cover;background:#111}
   body.has-video .avatar{display:none}
   body.has-video .top,body.has-video h1,body.has-video .status,body.has-video .timer,body.has-video .notes,body.has-video .buttons{position:relative;z-index:1}
   body.has-video h1{margin-top:auto;margin-top:18px;color:#fff;text-shadow:0 1px 3px #000a}
@@ -430,12 +440,13 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
   body.compact .avatar{width:64px;height:64px;margin-top:24px;font-size:26px}
   body.compact h1{font-size:14px;margin:10px 8px 0;max-width:160px}
   body.compact .timer{font-size:12px}
-  body.compact #incall .b:not(.endb),body.compact .b span{display:none!important}
+  body.compact #incall .b:not(.endb):not(.micb),body.compact .b span{display:none!important}
   body.compact .buttons{margin-bottom:14px}
   body.compact #self{width:48px;height:85px;top:38px;right:6px}
   .hide{display:none!important}
 </style></head><body>
   <canvas id="video"></canvas>
+  <div id="stage"></div>
   <canvas id="self"></canvas>
   <div class="top"><span class="tag" id="tag">Cuộc gọi video</span>
     <span class="wctl"><button id="compactBtn" title="Thu gọn">${svg('compact')}</button><button id="minBtn" title="Thu nhỏ xuống thanh tác vụ">${svg('minimize')}</button></span></div>
@@ -445,7 +456,7 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
   <div class="timer" id="timer"></div>
   <div class="notes"><span class="note hide" id="peerCam">${svg('camOff')}<span>Đã tắt camera</span></span><span class="note hide" id="peerMic">${svg('micOff')}<span>Đã tắt micro</span></span><span class="note hide" id="peerShare">${svg('screen')}<span>Đang chia sẻ màn hình</span></span></div>
   <div class="buttons" id="incall">
-    <div class="b"><button id="mute" title="Tắt micro">${svg('mic')}</button><button class="caret" data-kind="mic" title="Chọn micro">${svg('caret')}</button><span id="muteL">Micro</span></div>
+    <div class="b micb"><button id="mute" title="Tắt micro">${svg('mic')}</button><button class="caret" data-kind="mic" title="Chọn micro">${svg('caret')}</button><span id="muteL">Micro</span></div>
     <div class="b camb"><button id="cam" title="Tắt camera">${svg('cam')}</button><button class="caret" data-kind="camera" title="Chọn camera">${svg('caret')}</button><span id="camL">Camera</span></div>
     <div class="b camb"><button id="screen" title="Chia sẻ màn hình">${svg('screen')}</button><span id="screenL">Chia sẻ</span></div>
     <div class="b"><button id="speaker" title="Tắt loa">${svg('speaker')}</button><button class="caret" data-kind="speaker" title="Chọn loa">${svg('caret')}</button><span id="speakerL">Loa</span></div>
@@ -466,7 +477,7 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
   $('end').onclick = () => act('hangup');
   $('reject').onclick = () => act('reject');
   $('accept').onclick = () => act('accept');
-  $('mute').onclick = () => act('mute', { on: !state.muted });
+  $('mute').onclick = () => { const on = !state.muted; act('log', { text: 'mute ' + (on ? 'on' : 'off') }); act('mute', { on }); };
   let compactMode = false, autoCompact = false;
   $('minBtn').onclick = () => ipcRenderer.send('zcall-ui-window', 'minimize');
   $('compactBtn').onclick = () => { autoCompact = false; ipcRenderer.send('zcall-ui-window', compactMode ? 'expand' : 'compact'); };
@@ -513,8 +524,12 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
     const upd = () => { $('timer').textContent = s.since && !ended ? fmt(Date.now() - s.since) : ''; };
     upd(); if (s.since && !ended) tick = setInterval(upd, 500);
   }
+  // Group layer 0. open() and a 1-1 state omit the key, which clears it.
+  // status() keeps the key once the engine has set it.
+  let cameraEncode = null;
   ipcRenderer.on('zcall-ui-state', (_e, s) => {
     state = s || {};
+    cameraEncode = state.cameraEncode || null;
     if (state.phase !== 'connected') {
       stopVideo(); stopLocal(); sharing = false;
       if (pendingScreen) { pendingScreen.stop(); pendingScreen = null; }
@@ -526,7 +541,7 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
   // --- what we send (camera or screen): capture, preview, H.264 encode, frames to the engine ---
   const self = $('self'); const sg = self.getContext('2d');
   // local: the capture running, { kind: 'camera' | 'screen', stop }.
-  let camOn = true, noCamera = false, sharing = false, local = null, enc = null, nFrames = 0, lastAt = 0;
+  let camOn = true, noCamera = false, sharing = false, local = null, enc = null, nFrames = 0, lastAt = 0, encErrLogged = false;
   let camPref = null, curCamId = ''; // saved choice { id, label }; the camera in use
   // Encoder settings per source. Level 3.0 (avc1.42E01E) holds 640 px: a
   // 1920x1080 camera (Iriun) encoded as is never shows on the phone. The
@@ -538,6 +553,23 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
   const KEY_MS = 2000;
   let forceKey = true, lastKeyAt = 0; // key frame now (engine asked: start, PLI) / every KEY_MS
   let scaler = null, scalerG = null;
+  // One object per layer-0 key, so the encoder is not reconfigured every frame.
+  let groupProfile = null, groupKey = '';
+  function sendProfile() {
+    if (sharing) return PROFILES.screen;
+    const e = cameraEncode;
+    if (!e || !(e.width > 0) || !(e.height > 0)) return PROFILES.camera;
+    const w = e.width & ~1, h = e.height & ~1;
+    const fps = e.fps > 0 ? e.fps : PROFILES.camera.fps;
+    const bitrate = e.bitrate > 0 ? e.bitrate : PROFILES.camera.bitrate;
+    const keyMs = e.keyMs > 0 ? e.keyMs : 1000;
+    const codec = Math.max(w, h) <= 640 ? 'avc1.42E01E' : 'avc1.42E028';
+    const key = w + 'x' + h + '@' + fps + '/' + bitrate + '/' + keyMs + '/' + codec;
+    if (groupProfile && groupKey === key) return groupProfile;
+    groupKey = key;
+    groupProfile = { fps: fps, width: w, height: h, bitrate: bitrate, keyMs: keyMs, codec: codec, exact: true };
+    return groupProfile;
+  }
   $('cam').onclick = () => {
     if (noCamera) return;
     camOn = !camOn;
@@ -551,39 +583,78 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
     return btoa(s);
   }
   function encodeFrame(frame) {
-    const P = PROFILES[sharing ? 'screen' : 'camera'];
-    const now = performance.now();
-    if (now - lastAt < 1000 / P.fps - 5) { frame.close(); return; }
-    lastAt = now;
-    const k = Math.min(1, P.maxSide / Math.max(frame.displayWidth, frame.displayHeight));
-    const w = Math.round(frame.displayWidth * k) & ~1, h = Math.round(frame.displayHeight * k) & ~1;
-    if (k < 1) {
-      if (!scaler || scaler.width !== w || scaler.height !== h) { scaler = new OffscreenCanvas(w, h); scalerG = scaler.getContext('2d'); }
-      scalerG.drawImage(frame, 0, 0, w, h);
-      const ts = frame.timestamp; frame.close();
-      frame = new VideoFrame(scaler, { timestamp: ts });
+    let current = frame;
+    try {
+      const P = sendProfile();
+      const now = performance.now();
+      if (now - lastAt < 1000 / P.fps - 5) return;
+      lastAt = now;
+      let w, h, src = current;
+      if (P.exact) {
+        // Fit inside the announced layer and pad black, so the SPS matches sub 12.
+        // Software encoder: the hardware path on this N100 stalled the preview.
+        w = P.width; h = P.height;
+        if (!scaler || scaler.width !== w || scaler.height !== h) { scaler = new OffscreenCanvas(w, h); scalerG = scaler.getContext('2d'); }
+        const sw = current.displayWidth || w, sh = current.displayHeight || h;
+        const fit = Math.min(w / sw, h / sh);
+        let dw = Math.round(sw * fit) & ~1, dh = Math.round(sh * fit) & ~1;
+        if (dw > w) dw = w; if (dh > h) dh = h;
+        if (dw < 2) dw = 2; if (dh < 2) dh = 2;
+        const dx = Math.floor((w - dw) / 2) & ~1, dy = Math.floor((h - dh) / 2) & ~1;
+        scalerG.fillStyle = '#000';
+        scalerG.fillRect(0, 0, w, h);
+        scalerG.drawImage(current, dx, dy, dw, dh);
+        const ts = current.timestamp;
+        const cam = current;
+        current = new VideoFrame(scaler, { timestamp: ts });
+        cam.close();
+        src = scaler;
+      } else {
+        const k = Math.min(1, P.maxSide / Math.max(current.displayWidth, current.displayHeight));
+        w = Math.round(current.displayWidth * k) & ~1; h = Math.round(current.displayHeight * k) & ~1;
+        if (k < 1) {
+          if (!scaler || scaler.width !== w || scaler.height !== h) { scaler = new OffscreenCanvas(w, h); scalerG = scaler.getContext('2d'); }
+          scalerG.drawImage(current, 0, 0, w, h);
+          const ts = current.timestamp;
+          const cam = current;
+          current = new VideoFrame(scaler, { timestamp: ts });
+          cam.close();
+          src = scaler;
+        }
+      }
+      if (!enc || enc.state === 'closed' || enc.w !== w || enc.h !== h || enc.profile !== P) {
+        if (enc && enc.state !== 'closed') try { enc.close(); } catch (e1) {}
+        enc = new VideoEncoder({
+          output: (chunk) => {
+            const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data);
+            act('videoFrame', { key: chunk.type === 'key', data: b64(data) });
+          },
+          error: (err) => {
+            if (!encErrLogged) { encErrLogged = true; act('log', { text: 'encoder error ' + ((err && err.message) || err || 'unknown') }); }
+            enc = null;
+          },
+        });
+        const cfg = { codec: P.codec, width: w, height: h, bitrate: P.bitrate, framerate: P.fps, avc: { format: 'annexb' }, latencyMode: 'realtime' };
+        if (P.exact) cfg.hardwareAcceleration = 'prefer-software';
+        enc.configure(cfg);
+        enc.w = w; enc.h = h; enc.profile = P; nFrames = 0;
+      }
+      if (self.width !== w || self.height !== h) { self.width = w; self.height = h; }
+      sg.drawImage(src, 0, 0);
+      document.body.classList.add('has-self');
+      if (enc.encodeQueueSize < 3) {
+        const keyEvery = P.keyMs || KEY_MS;
+        const key = forceKey || nFrames++ === 0 || now - lastKeyAt >= keyEvery;
+        if (key) { forceKey = false; lastKeyAt = now; }
+        enc.encode(current, { keyFrame: key });
+      }
+    } catch (err) {
+      if (!encErrLogged) { encErrLogged = true; act('log', { text: 'encode failed ' + ((err && err.message) || err || 'unknown') }); }
+      try { if (enc && enc.state !== 'closed') enc.close(); } catch (e2) {}
+      enc = null;
+    } finally {
+      try { current.close(); } catch (e3) {}
     }
-    if (!enc || enc.state === 'closed' || enc.w !== w || enc.h !== h || enc.profile !== P) {
-      if (enc && enc.state !== 'closed') try { enc.close(); } catch (_) {}
-      enc = new VideoEncoder({
-        output: (chunk) => {
-          const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data);
-          act('videoFrame', { key: chunk.type === 'key', data: b64(data) });
-        },
-        error: () => { enc = null; },
-      });
-      enc.configure({ codec: P.codec, width: w, height: h, bitrate: P.bitrate, framerate: P.fps, avc: { format: 'annexb' }, latencyMode: 'realtime' });
-      enc.w = w; enc.h = h; enc.profile = P; nFrames = 0;
-    }
-    if (self.width !== w || self.height !== h) { self.width = w; self.height = h; }
-    sg.drawImage(frame, 0, 0);
-    document.body.classList.add('has-self');
-    if (enc.encodeQueueSize < 3) {
-      const key = forceKey || nFrames++ === 0 || now - lastKeyAt >= KEY_MS;
-      if (key) { forceKey = false; lastKeyAt = now; }
-      enc.encode(frame, { keyFrame: key });
-    }
-    frame.close();
   }
   // Frames of the track to the encoder until cap.stop(). onFirst(frame)
   // decides about the first one (true: encode it); onEnd() when the track
@@ -593,11 +664,15 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
     let alive = true, first = true;
     cap.stop = () => { alive = false; track.stop(); try { reader.cancel(); } catch (_) {} };
     (async () => {
-      while (alive) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (first && onFirst) { first = false; if (!onFirst()) { value.close(); continue; } }
-        if (alive) encodeFrame(value); else value.close();
+      try {
+        while (alive) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (first && onFirst) { first = false; if (!onFirst()) { value.close(); continue; } }
+          if (alive) encodeFrame(value); else value.close();
+        }
+      } catch (err) {
+        act('log', { text: 'capture stopped ' + ((err && err.message) || err || 'unknown') });
       }
       if (alive && onEnd) onEnd();
     })();
@@ -607,6 +682,8 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
     local = { kind: 'camera', stop: () => {} };
     const mine = local;
     try {
+      // Capture at the size the 1-1 path already used. The group layer is
+      // scaled in the canvas; ideal 480x240 froze the camera on this PC.
       const want = { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: PROFILES.camera.fps } };
       const camId = await chosenCamera();
       let stream;
@@ -701,16 +778,30 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
     curCamId = '';
     if (enc && enc.state !== 'closed') try { enc.close(); } catch (_) {}
     enc = null;
+    encErrLogged = false;
     document.body.classList.remove('has-self');
   }
 
   // Received video: H.264 Annex-B frames decoded with WebCodecs, drawn on the canvas.
+  // 1-1 is one stream on #video. A group call is one decoder per member (src):
+  // two people sharing one decoder errors after a few frames and the last
+  // picture stays up.
   const canvas = $('video'); const g = canvas.getContext('2d');
   let dec = null, decCodec = null, ts = 0;
+  const tiles = new Map();
   function stopVideo() {
     if (dec && dec.state !== 'closed') try { dec.close(); } catch (_) {}
     dec = null; decCodec = null;
-    document.body.classList.remove('has-video');
+    for (const t of tiles.values()) if (t.dec && t.dec.state !== 'closed') try { t.dec.close(); } catch (_) {}
+    tiles.clear();
+    $('stage').textContent = '';
+    $('stage').className = '';
+    document.body.classList.remove('has-video', 'has-tiles');
+  }
+  function annexB(m) {
+    const bin = atob(m.data); const data = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) data[i] = bin.charCodeAt(i);
+    return data;
   }
   function newDecoder(codec) {
     if (dec && dec.state !== 'closed') try { dec.close(); } catch (_) {}
@@ -726,13 +817,50 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuộc g�
     // Software: the hardware path refuses these streams on this Electron.
     dec.configure({ codec, optimizeForLatency: true, hardwareAcceleration: 'prefer-software' });
   }
+  function showMember(m) {
+    let t = tiles.get(m.src);
+    if (!t) {
+      const c = document.createElement('canvas');
+      $('stage').appendChild(c);
+      t = { canvas: c, g: c.getContext('2d'), dec: null, codec: null, ts: 0, logged: false, errLogged: false };
+      tiles.set(m.src, t);
+      const n = Math.min(tiles.size, 4);
+      $('stage').className = 'n' + n;
+      document.body.classList.add('has-video', 'has-tiles');
+    }
+    if (m.key && (!t.dec || t.dec.state === 'closed' || m.codec !== t.codec)) {
+      if (t.dec && t.dec.state !== 'closed') try { t.dec.close(); } catch (_) {}
+      t.codec = m.codec;
+      const src = m.src;
+      t.dec = new VideoDecoder({
+        output: (f) => {
+          if (t.canvas.width !== f.displayWidth || t.canvas.height !== f.displayHeight) {
+            t.canvas.width = f.displayWidth; t.canvas.height = f.displayHeight;
+            if (!t.logged) { t.logged = true; act('log', { text: 'video ' + src + ' ' + f.displayWidth + 'x' + f.displayHeight }); }
+          }
+          t.g.drawImage(f, 0, 0); f.close();
+          document.body.classList.add('has-video', 'has-tiles');
+        },
+        error: (e) => {
+          t.dec = null;
+          if (!t.errLogged) { t.errLogged = true; act('log', { text: 'video decode ' + src + ': ' + (e && e.message ? e.message : e) }); }
+        },
+      });
+      t.dec.configure({ codec: m.codec, optimizeForLatency: true, hardwareAcceleration: 'prefer-software' });
+    }
+    if (!t.dec || t.dec.state !== 'configured') return;
+    try { t.dec.decode(new EncodedVideoChunk({ type: m.key ? 'key' : 'delta', timestamp: t.ts += 66666, data: annexB(m) })); }
+    catch (e) {
+      t.dec = null;
+      if (!t.errLogged) { t.errLogged = true; act('log', { text: 'video decode ' + m.src + ': ' + (e && e.message ? e.message : e) }); }
+    }
+  }
   ipcRenderer.on('zcall-ui-video', (_e, m) => {
     if (state.phase !== 'connected') return;
+    if (m.src) { showMember(m); return; }
     if (m.key && (!dec || dec.state === 'closed' || m.codec !== decCodec)) newDecoder(m.codec);
     if (!dec || dec.state !== 'configured') return;
-    const bin = atob(m.data); const data = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) data[i] = bin.charCodeAt(i);
-    try { dec.decode(new EncodedVideoChunk({ type: m.key ? 'key' : 'delta', timestamp: ts += 66666, data })); } catch (_) { dec = null; }
+    try { dec.decode(new EncodedVideoChunk({ type: m.key ? 'key' : 'delta', timestamp: ts += 66666, data: annexB(m) })); } catch (_) { dec = null; }
   });
   ipcRenderer.on('zcall-ui-keyframe', () => { forceKey = true; });
 

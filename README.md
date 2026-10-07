@@ -48,7 +48,7 @@ Zalo không có bản Linux. Các bản Zalo cho Linux trước đây chạy ph�
 | Khử vọng, khử ồn, tự cân mức micro | ✅ (cần PipeWire) |
 | Thu nhỏ / thu gọn cửa sổ gọi; tự thu gọn khi chia sẻ màn hình | ✅ |
 | P2P khi cùng mạng, relay khi khác mạng | ✅ |
-| Gọi nhóm | ❌ chưa hỗ trợ (cửa sổ gọi báo rõ) |
+| Gọi nhóm | ⚠️ thử nghiệm, chỉ âm thanh (`ZCALL_GROUP=1`) |
 
 ### Cài đặt
 
@@ -73,6 +73,7 @@ Gọi điện cần thêm `python3`, libopus và bộ công cụ PulseAudio. N�
 | `ZCALL_MIC` / `ZCALL_SPEAKER` | Chọn micro / loa (tên nguồn PulseAudio). Nút ▾ trong cửa sổ gọi làm được việc này |
 | `ZCALL_AUDIO_PROCESSING=0` | Gọi không qua khử vọng / khử ồn |
 | `ZCALL_VERBOSE=1` | Ghi chi tiết cuộc gọi vào `~/.config/ZaloData/native-engine-*.log` |
+| `ZCALL_GROUP=1` | Nhận cuộc gọi nhóm (thử nghiệm, chỉ âm thanh) |
 
 ### Build từ mã nguồn
 
@@ -88,7 +89,7 @@ Cần Node.js 20 trở lên, Rust, `build-essential`, `liblzma-dev`, `p7zip-full
 
 ### Giới hạn hiện tại
 
-- Chưa có gọi nhóm: Zalo dùng cơ chế riêng cho nhóm (máy chủ SFU, video nhiều lớp).
+- Gọi nhóm còn thử nghiệm (`ZCALL_GROUP=1`, chỉ âm thanh); mặc định cửa sổ gọi báo chưa hỗ trợ.
 - Nhận chia sẻ màn hình *từ* điện thoại chưa kiểm chứng (Zalo trên điện thoại không có nút này).
 - Chưa thử gọi điện trên aarch64 (engine không có phần nào chỉ chạy được trên x86).
 
@@ -144,7 +145,7 @@ Zalo has no Linux version. Earlier Zalo-for-Linux builds ran calls through `Zalo
 | Echo cancellation, noise suppression, gain control | ✅ (needs PipeWire) |
 | Minimize / compact the call window; compact while sharing | ✅ |
 | P2P on the same network, relay otherwise | ✅ |
-| Group calls | ❌ not supported yet (the call window says so) |
+| Group calls | ⚠️ experimental, audio only (`ZCALL_GROUP=1`) |
 
 ### Install
 
@@ -169,6 +170,7 @@ Calls also need `python3`, libopus and the PulseAudio tools. If something is mis
 | `ZCALL_MIC` / `ZCALL_SPEAKER` | Microphone / speaker (PulseAudio source / sink name). The ▾ in the call window does the same |
 | `ZCALL_AUDIO_PROCESSING=0` | Calls without echo cancellation / noise suppression |
 | `ZCALL_VERBOSE=1` | Log call details to `~/.config/ZaloData/native-engine-*.log` |
+| `ZCALL_GROUP=1` | Answer group calls (experimental, audio only) |
 
 ### Build from source
 
@@ -184,7 +186,7 @@ Needs Node.js 20 or later, Rust, `build-essential`, `liblzma-dev`, `p7zip-full`.
 
 ### Current limits
 
-- No group calls: Zalo uses a separate mechanism for them (SFU servers, layered video).
+- Group calls are experimental (`ZCALL_GROUP=1`, audio only); by default the call window says they are not supported.
 - Receiving a screen share *from* a phone is untested (Zalo's phone app has no such button).
 - Calls are untested on aarch64 (the engine has no x86-only parts).
 

@@ -17,7 +17,7 @@ async function main() {
     fs.copyFileSync(sourceNodePath, targetNodePath);
     logger.dim('SQLite3 Linux binary installed from node_modules');
   } else {
-    logger.warn('SQLite3 binary not found in node_modules. Run "npm install" first.');
+    throw new Error('SQLite3 binary not found in node_modules. Run npm ci first.');
   }
 }
 

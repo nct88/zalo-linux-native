@@ -43,10 +43,10 @@ The AppImages carry update information for this repository's releases.
 
 Each change to Zalo's code is a script in `scripts/patches/` exporting
 `main()`, listed in order in `PATCHES` (`scripts/prepare-app.js`). A patch
-looks for the exact code it changes and does nothing (with a warning) when
-it is not there: Zalo's minified code changes between versions. When a
-partial change would break something, change nothing at all — see
-`patch-zcall-native.js`.
+looks for the exact code it changes. When a partial change would break
+something, change nothing at all — see `patch-zcall-native.js`. The call
+patches (`patch-zcall-native`, `patch-zcall-callgate`) fail the build when
+they do not apply, so a Zalo update cannot ship without working calls.
 
 ## Calls
 

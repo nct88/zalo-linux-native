@@ -20,13 +20,15 @@ Stops when stdin closes. Logs go to stderr.
   --mic / --speaker   PulseAudio source / sink to use (else ZCALL_MIC / ZCALL_SPEAKER, else the default)
 
 With PipeWire the microphone goes through WebRTC audio processing (echo
-cancellation, noise suppression, high-pass filter), as the real engine does
+cancellation and noise suppression), as the real engine does
 (zrtc_config audioEchoCancellation / audioNoiseSuppression), and received
-audio is played through it as the echo reference. ZCALL_AUDIO_PROCESSING=0
-turns it off. No gain control: PipeWire's webrtc.gain_control turns on two
-digital AGCs at once (AGC1 adaptive digital + AGC2), which pump the noise up
-and distort loud speech; the real engine uses one analog AGC
-(AgcManagerDirect, the OS microphone volume).
+audio is played through it as the echo reference. The high-pass filter is on
+unless --no-high-pass (a group call whose zrtcConfig has audioHighPassFilter
+false). ZCALL_AUDIO_PROCESSING=0 turns processing off. No gain control:
+PipeWire's webrtc.gain_control turns on two digital AGCs at once (AGC1
+adaptive digital + AGC2), which pump the noise up and distort loud speech;
+the real engine uses one analog AGC (AgcManagerDirect, the OS microphone
+volume). Do not turn gain_control on from here.
 """
 from __future__ import annotations
 
@@ -176,7 +178,7 @@ context.modules = [
         aec.args = {
             webrtc.gain_control = false
             webrtc.noise_suppression = true
-            webrtc.high_pass_filter = true
+            webrtc.high_pass_filter = @HPF@
             webrtc.extended_filter = true
             webrtc.delay_agnostic = true
         }
@@ -207,10 +209,11 @@ class Processing:
     echo reference) that exist as long as the process. The system's default
     devices stay as they are."""
 
-    def __init__(self):
+    def __init__(self, high_pass=True):
         self.tag = f"zcall_ec_{os.getpid()}"
         self.source = self.tag + "_source"
         self.sink = self.tag + "_sink"
+        self.high_pass = bool(high_pass)
         self.proc = None
         self.conf = None
 
@@ -218,7 +221,8 @@ class Processing:
         """(Re)start on these devices (None: follow the default). False if it is not available."""
         self.stop()
         target = lambda n: f'target.object = "{n}" node.dont-reconnect = true' if n else ""  # noqa: E731
-        conf = EC_CONF.replace("@TAG@", self.tag).replace("@MIC@", target(mic)).replace("@SPEAKER@", target(speaker))
+        conf = (EC_CONF.replace("@TAG@", self.tag).replace("@MIC@", target(mic))
+                .replace("@SPEAKER@", target(speaker)).replace("@HPF@", "true" if self.high_pass else "false"))
         fd, self.conf = tempfile.mkstemp(prefix="zcall-ec-", suffix=".conf")
         with os.fdopen(fd, "w") as f:
             f.write(conf)
@@ -556,9 +560,12 @@ def encoder_loop(args, opus, muted, out, lock, mic):
     opus.opus_encoder_ctl(enc, OPUS_SET_BITRATE, args.bitrate)
     opus.opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY, args.complexity)
     opus.opus_encoder_ctl(enc, OPUS_SET_SIGNAL, OPUS_SIGNAL_VOICE)
-    # In-band FEC: a lost packet can be rebuilt from the next one.
-    opus.opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC, 1)
-    opus.opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC, args.loss)
+    # In-band FEC is the 1-1 default. A group zrtcConfig with audioFecInband
+    # false passes --no-fec: those bits would otherwise eat the 20 kbps frame.
+    fec = 0 if args.no_fec else 1
+    opus.opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC, fec)
+    opus.opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC, 0 if args.no_fec else args.loss)
+    log(f"encode {args.bitrate} bps complexity {args.complexity} fec {fec} high-pass {not args.no_high_pass}")
     buf = ctypes.create_string_buffer(1500)
     silence = bytes(FRAME_BYTES)
 
@@ -601,10 +608,12 @@ def encoder_loop(args, opus, muted, out, lock, mic):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    # 32 kbit/s: what Zalo's bandwidth profiles give audio (bwProfiles audioBitrate).
+    # 1-1 default. A group call passes zrtcConfig.audioBitrate (kbps * 1000) instead.
     ap.add_argument("--bitrate", type=int, default=32000)
     ap.add_argument("--complexity", type=int, default=10)
     ap.add_argument("--loss", type=int, default=5, help="expected packet loss %% (Opus FEC)")
+    ap.add_argument("--no-fec", action="store_true", help="audioFecInband false: FEC off, expected loss 0")
+    ap.add_argument("--no-high-pass", action="store_true", help="audioHighPassFilter false")
     ap.add_argument("--jitter", type=int, default=10, help="jitter buffer depth in 20 ms frames")
     ap.add_argument("--device", help="ALSA device (default: PulseAudio if running)")
     ap.add_argument("--out", type=Path, help="write received audio to this file instead of playing")
@@ -620,7 +629,7 @@ def main():
     # The devices picked (None: the default); with processing, what it is attached to.
     chosen = {"mic": present(args.mic, "sources") if pulse else None,
               "speaker": present(args.speaker, "sinks") if pulse else None}
-    proc = Processing() if pulse and os.environ.get("ZCALL_AUDIO_PROCESSING", "1") != "0" else None
+    proc = Processing(high_pass=not args.no_high_pass) if pulse and os.environ.get("ZCALL_AUDIO_PROCESSING", "1") != "0" else None
 
     def start_processing() -> bool:
         return proc.start(chosen["mic"] or pulse_mic(), chosen["speaker"]) if proc else False
