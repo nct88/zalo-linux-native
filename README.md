@@ -46,7 +46,10 @@ Zalo không có bản Linux. Các bản Zalo cho Linux trước đây chạy ph�
 | Chọn micro / loa / camera ngay trong cuộc gọi, nhớ lựa chọn | ✅ |
 | Hiển thị trạng thái camera / mic của bên kia | ✅ |
 | Khử vọng, khử ồn, tự cân mức micro | ✅ (cần PipeWire) |
+| Giao diện nghe gọi theo Zalo macOS: biểu tượng, âm thanh, font gốc (lấy từ DMG lúc build) | ✅ |
+| Khung báo cuộc gọi đến ở góc màn hình, "Trả lời không mở camera" | ✅ |
 | Thu nhỏ / thu gọn cửa sổ gọi; tự thu gọn khi chia sẻ màn hình | ✅ |
+| Chuyển từ gọi thoại sang gọi video giữa cuộc gọi | ❌ Zalo PC (macOS, Windows) cũng không hỗ trợ, chỉ điện thoại với điện thoại |
 | P2P khi cùng mạng, relay khi khác mạng | ✅ |
 | Gọi nhóm: âm thanh, camera, chia sẻ màn hình (gửi), xem camera các thành viên | ✅ (đã thử với điện thoại và Zalo macOS) |
 
@@ -146,7 +149,10 @@ Zalo has no Linux version. Earlier Zalo-for-Linux builds ran calls through `Zalo
 | Pick microphone / speaker / camera during a call, remembered | ✅ |
 | The other side's camera / mic state | ✅ |
 | Echo cancellation, noise suppression, gain control | ✅ (needs PipeWire) |
+| Call window laid out as Zalo for macOS: its own icons, sounds and fonts (from the DMG at build time) | ✅ |
+| Incoming call notice in the screen's corner, "answer without camera" | ✅ |
 | Minimize / compact the call window; compact while sharing | ✅ |
+| Switching a voice call to video during the call | ❌ Zalo PC (macOS, Windows) cannot either; phone to phone only |
 | P2P on the same network, relay otherwise | ✅ |
 | Group calls: audio, camera, screen sharing (sending), the members' cameras | ✅ (tried with a phone and Zalo for macOS) |
 

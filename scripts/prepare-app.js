@@ -130,8 +130,9 @@ async function extractDMG() {
       throw new Error('7z is required for DMG extraction.');
     }
 
-    logger.info(`Extracting app.asar from ${selectedFile.name}...`);
-    const extractCommand = `7z x "${dmgPath}" "Zalo*/Zalo.app/Contents/Resources/app.asar*"`;
+    logger.info(`Extracting app.asar and the call helper from ${selectedFile.name}...`);
+    // ZaloCall: only for its icons and sounds (scripts/extract-zcall-assets.js).
+    const extractCommand = `7z x "${dmgPath}" "Zalo*/Zalo.app/Contents/Resources/app.asar*" "Zalo*/Zalo.app/Contents/ZaloHelper.app/Contents/MacOS/ZaloCall"`;
 
     try {
       execSync(extractCommand, { cwd: TEMP_DIR, stdio: 'pipe' });
@@ -179,6 +180,8 @@ async function extractAppAsar() {
 
   logger.info('Applying platform patches...');
   for (const name of PATCHES) await require(`./patches/${name}`).main();
+
+  await require('./extract-zcall-assets').main();
 
   const mainJs = path.join(APP_DIR, 'main-dist', 'main.js');
   if (!fs.existsSync(mainJs) || !fs.readFileSync(mainJs, 'utf8').includes('ZCALL_ENGINE_JS')) {

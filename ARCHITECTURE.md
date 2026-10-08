@@ -11,7 +11,8 @@ zalo-linux-native/
 ├── main.js                 Electron entry: tray, main window, plugins, then Zalo's bootstrap
 ├── plugins/
 │   ├── zcall/              Calls: engine environment + system package check (index.js),
-│   │                       the call window (window.js)
+│   │                       the call window (window.js + ui/call.*), the incoming call
+│   │                       notice (incoming.js + ui/incoming.*), laid out as Zalo for macOS
 │   ├── tray-host/          Is there a StatusNotifier tray? (hide to tray, or quit on close)
 │   ├── start-hidden/       Start hidden in the tray
 │   ├── window-state/       Remember the main window's size and position
@@ -24,6 +25,7 @@ zalo-linux-native/
 │   ├── check-versions.js   Zalo version (latest macOS release unless ZALO_VERSION)
 │   ├── download-dmg.js     The official DMG into temp/
 │   ├── prepare-app.js      Extract app.asar into app/, apply the patches (ordered list)
+│   ├── extract-zcall-assets.js  Zalo's own call icons, sounds, fonts → app/zcall-assets/
 │   ├── patches/            One script per change to Zalo's code
 │   ├── build.js            app/ → dist/Zalo-Linux-Native-<version>-<arch>.AppImage
 │   └── build-stage2.sh     Repack with quick-sharun, embed the update information
