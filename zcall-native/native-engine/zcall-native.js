@@ -10,9 +10,9 @@
 //   --media stub   signalling only, no media (default; ZCALL_MEDIA)
 //   --media zrtc   Zalo relay media; packets leave the machine only with
 //                  --send-udp (ZCALL_SEND_UDP=1)
-//   --group        answer incoming group calls (ZCALL_GROUP=1).
-//                  ZCALL_GROUP_CAMERA=1 also sends our H.264 as plain RTP.
-//                  Experimental; see docs/GROUP-CALL.md.
+//   --group        group calls (the default; ZCALL_GROUP=0 turns them off and
+//                  the call window says they are not supported): audio, camera
+//                  (ZCALL_GROUP_CAMERA=0 keeps it local) and screen share.
 //
 // Zalo-Linux's patched main process spawns it on its own Electron
 // (ELECTRON_RUN_AS_NODE) with the ports and a fresh token. It writes
@@ -38,8 +38,9 @@ const sendPort = Number(opt('send', 29632)); // zalo -> engine
 const mediaMode = opt('media', process.env.ZCALL_MEDIA || 'stub');
 const sendUdp = args.includes('--send-udp') || process.env.ZCALL_SEND_UDP === '1';
 const verbose = args.includes('--verbose') || !!process.env.ZCALL_VERBOSE;
-// Answer incoming group calls (experimental, audio only): --group or ZCALL_GROUP=1.
-const group = args.includes('--group') || process.env.ZCALL_GROUP === '1';
+// Group calls are on unless ZCALL_GROUP=0 (live with a phone and the macOS client,
+// 2026-10-08: audio, camera and screen share both ways).
+const group = args.includes('--group') || process.env.ZCALL_GROUP !== '0';
 if (!token) { console.error('need --token <TK> (the value Zalo passes on the command line)'); process.exit(2); }
 
 const key = loadKey();

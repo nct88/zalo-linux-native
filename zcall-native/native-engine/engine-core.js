@@ -65,8 +65,8 @@ const noUi = { open() {}, status() {}, close() {}, onHangup() {}, incoming() {} 
 
 class EngineCore {
   // emit(frame) sends one engine->zalo frame: { type, command, data }.
-  // group: answer incoming group calls (experimental, ZCALL_GROUP=1);
-  // otherwise the call window says they are not supported.
+  // group: group calls (zcall-native.js: on unless ZCALL_GROUP=0); otherwise
+  // the call window says they are not supported.
   constructor({ emit, media = new MediaBackend(), log = () => {}, ui = noUi, group = false }) {
     this.emit = emit;
     this.groupEnabled = !!group;
@@ -192,6 +192,9 @@ class EngineCore {
     c.sharing = !!on;
     this.log('screen share', on ? 'on' : 'off');
     if (c.group) {
+      // The screen's own peer (UID = shareScreenId) once the server gave the id.
+      if (!on && this.media.stopShare) this.media.stopShare();
+      if (on && c.shareScreenId > 0 && this.media.startShare) this.media.startShare(c.shareScreenId);
       const st = this._groupState(c);
       this.emit({
         type: 'sendSignal',
@@ -682,7 +685,7 @@ class EngineCore {
         if (who && who !== c.localUid) this._groupMember(who, { state: Number(d.callState) === 3 ? 'incall' : 'ringing', muted: Number(d.audioState) === 1 });
         return;
       case 'group_answer':
-        if (who && who !== c.localUid) this._groupMember(who, { state: 'incall' });
+        if (who && who !== c.localUid) { this._groupMember(who, { state: 'incall' }); this._groupGreet(who); }
         return;
       // fromId = the member being rung, receiverId = us (log 2026-10-01).
       case 'group_ring_ring':
@@ -965,10 +968,35 @@ class EngineCore {
   _groupCameraProfile() {
     const plan = this.media && this.media.videoPlan;
     if (plan && plan.encode && this.ui.setCameraEncode) this.ui.setCameraEncode(plan.encode);
+    // The screen: shorter side 720 px (ZCALL_SHARE_RES), maxShrScreenBr kbps (1500 in
+    // the group config). 480 px / 900 kbps (maxShrScreenRes / minShrScreenBr) was
+    // too blurred to read on the Mac and the phone (2026-10-08); the 70-packet key
+    // frame of 720p goes out paced (zrtc-media SHARE_BURST) and arrives whole.
+    const cfg = (this.call && this.call.config) || (this.media && this.media.params && this.media.params.config) || {};
+    const maxShort = Number(process.env.ZCALL_SHARE_RES) > 0 ? Math.trunc(Number(process.env.ZCALL_SHARE_RES)) : 720;
+    const kbps = Number(cfg.maxShrScreenBr) > 0 ? Math.trunc(Number(cfg.maxShrScreenBr)) : 1500;
+    if (this.ui.setScreenEncode) this.ui.setScreenEncode({ maxShort, bitrate: kbps * 1000 });
   }
 
   _groupState(c) {
     return { audioState: c.muted ? 1 : 0, callId: c.callId, callState: 3, hostCall: c.hostCall, userId: c.localUid, videoState: c.cameraOn ? 0 : 1 };
+  }
+
+  // A member who joins after our camera / mic change never got that 12098: the
+  // phone then drew our tile as camera off (avatar) although it subscribed to our
+  // video, and showed it only after we turned the camera off and on again (live
+  // 2026-10-08, our outgoing group call). Say our state again when someone joins,
+  // and once more 2 s later, once per member and call.
+  _groupGreet(uid) {
+    const c = this.call;
+    if (!c || !c.group || c.state !== 'connected') return;
+    if (uid === c.shareScreenId) return; // our own screen share peer
+    c.greeted = c.greeted || new Set();
+    if (c.greeted.has(uid)) return;
+    c.greeted.add(uid);
+    this.log('group: member', uid, 'joined, our state again');
+    this._groupBroadcast();
+    setTimeout(() => { if (this.call === c) this._groupBroadcast(); }, 2000).unref();
   }
 
   _groupBroadcast() {
@@ -1000,7 +1028,11 @@ class EngineCore {
     const c = this.call;
     if (!c || !c.group) return;
     const inRoom = new Set(uids);
-    for (const uid of inRoom) if (uid !== c.localUid) this._groupMember(uid, { state: 'incall' });
+    for (const uid of inRoom) {
+      if (uid === c.localUid) continue;
+      if ((c.members.get(uid) || {}).state !== 'incall') this._groupGreet(uid);
+      this._groupMember(uid, { state: 'incall' });
+    }
     for (const [uid, m] of c.members) if (m.state === 'incall' && !inRoom.has(uid)) c.members.set(uid, { ...m, state: 'left' });
     this._groupStatus();
     this._groupCheckEmpty('roster');

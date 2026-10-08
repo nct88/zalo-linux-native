@@ -48,7 +48,7 @@ Zalo không có bản Linux. Các bản Zalo cho Linux trước đây chạy ph�
 | Khử vọng, khử ồn, tự cân mức micro | ✅ (cần PipeWire) |
 | Thu nhỏ / thu gọn cửa sổ gọi; tự thu gọn khi chia sẻ màn hình | ✅ |
 | P2P khi cùng mạng, relay khi khác mạng | ✅ |
-| Gọi nhóm | ⚠️ thử nghiệm, chỉ âm thanh (`ZCALL_GROUP=1`) |
+| Gọi nhóm: âm thanh, camera, chia sẻ màn hình (gửi), xem camera các thành viên | ✅ (đã thử với điện thoại và Zalo macOS) |
 
 ### Cài đặt
 
@@ -73,7 +73,10 @@ Gọi điện cần thêm `python3`, libopus và bộ công cụ PulseAudio. N�
 | `ZCALL_MIC` / `ZCALL_SPEAKER` | Chọn micro / loa (tên nguồn PulseAudio). Nút ▾ trong cửa sổ gọi làm được việc này |
 | `ZCALL_AUDIO_PROCESSING=0` | Gọi không qua khử vọng / khử ồn |
 | `ZCALL_VERBOSE=1` | Ghi chi tiết cuộc gọi vào `~/.config/ZaloData/native-engine-*.log` |
-| `ZCALL_GROUP=1` | Nhận cuộc gọi nhóm (thử nghiệm, chỉ âm thanh) |
+| `ZCALL_GROUP=0` | Tắt gọi nhóm (cửa sổ gọi báo chưa hỗ trợ) |
+| `ZCALL_GROUP_CAMERA=0` | Gọi nhóm không gửi camera |
+| `ZCALL_GROUP_CAM_LAYER=0` / `1` / `2` | Kích thước camera khi gọi nhóm: 480×240, 720×360 (mặc định), 960×480 |
+| `ZCALL_SHARE_RES=720` | Cạnh ngắn của màn hình khi chia sẻ trong gọi nhóm (mặc định 720) |
 
 ### Build từ mã nguồn
 
@@ -89,7 +92,7 @@ Cần Node.js 20 trở lên, Rust, `build-essential`, `liblzma-dev`, `p7zip-full
 
 ### Giới hạn hiện tại
 
-- Gọi nhóm còn thử nghiệm (`ZCALL_GROUP=1`, chỉ âm thanh); mặc định cửa sổ gọi báo chưa hỗ trợ.
+- Gọi nhóm gửi một lớp camera (Zalo macOS gửi hai lớp); chưa thử xem màn hình do người khác chia sẻ trong gọi nhóm (luồng đó hiện như một ô thành viên).
 - Nhận chia sẻ màn hình *từ* điện thoại chưa kiểm chứng (Zalo trên điện thoại không có nút này).
 - Chưa thử gọi điện trên aarch64 (engine không có phần nào chỉ chạy được trên x86).
 
@@ -145,7 +148,7 @@ Zalo has no Linux version. Earlier Zalo-for-Linux builds ran calls through `Zalo
 | Echo cancellation, noise suppression, gain control | ✅ (needs PipeWire) |
 | Minimize / compact the call window; compact while sharing | ✅ |
 | P2P on the same network, relay otherwise | ✅ |
-| Group calls | ⚠️ experimental, audio only (`ZCALL_GROUP=1`) |
+| Group calls: audio, camera, screen sharing (sending), the members' cameras | ✅ (tried with a phone and Zalo for macOS) |
 
 ### Install
 
@@ -170,7 +173,10 @@ Calls also need `python3`, libopus and the PulseAudio tools. If something is mis
 | `ZCALL_MIC` / `ZCALL_SPEAKER` | Microphone / speaker (PulseAudio source / sink name). The ▾ in the call window does the same |
 | `ZCALL_AUDIO_PROCESSING=0` | Calls without echo cancellation / noise suppression |
 | `ZCALL_VERBOSE=1` | Log call details to `~/.config/ZaloData/native-engine-*.log` |
-| `ZCALL_GROUP=1` | Answer group calls (experimental, audio only) |
+| `ZCALL_GROUP=0` | No group calls (the call window says they are not supported) |
+| `ZCALL_GROUP_CAMERA=0` | Group calls without sending the camera |
+| `ZCALL_GROUP_CAM_LAYER=0` / `1` / `2` | Camera size in group calls: 480×240, 720×360 (default), 960×480 |
+| `ZCALL_SHARE_RES=720` | Shorter side of the shared screen in group calls (720 by default) |
 
 ### Build from source
 
@@ -186,7 +192,7 @@ Needs Node.js 20 or later, Rust, `build-essential`, `liblzma-dev`, `p7zip-full`.
 
 ### Current limits
 
-- Group calls are experimental (`ZCALL_GROUP=1`, audio only); by default the call window says they are not supported.
+- Group calls send one camera layer (Zalo for macOS sends two); viewing someone else's screen share in a group call is untested (it shows as a member tile).
 - Receiving a screen share *from* a phone is untested (Zalo's phone app has no such button).
 - Calls are untested on aarch64 (the engine has no x86-only parts).
 

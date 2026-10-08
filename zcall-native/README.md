@@ -15,9 +15,12 @@ captures), then export again.
   minimize / compact
 - sharing the screen in 1-1 video calls (PipeWire portal on Wayland)
 - WebRTC echo cancellation, noise suppression and gain control (PipeWire)
-- group calls: by default Zalo shows a "not supported" notice;
-  `ZCALL_GROUP=1` answers incoming group calls, audio only (experimental,
-  not yet tried against Zalo's servers)
+- group calls (on by default, `ZCALL_GROUP=0` turns them off): audio, our
+  camera (one 720x360 layer, `ZCALL_GROUP_CAM_LAYER`), our screen on its own
+  peer (UID = shareScreenId, `ZCALL_SHARE_RES`), the members' cameras. Tried
+  with a phone and Zalo for macOS; the packet formats were checked against a
+  capture of the macOS client (layer tables, SFU / abs-send-time / capture-time
+  extensions, ZaviPing)
 
 ## How Zalo-Linux runs it
 

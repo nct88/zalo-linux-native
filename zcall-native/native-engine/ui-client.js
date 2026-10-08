@@ -9,7 +9,7 @@
 //                 {type:"keyframe"}                    encode the next camera frame as a key frame
 //                 {type:"close", text}
 //   ui -> engine  {action:"hangup"|"accept"|"reject"|"mute"|"speaker"|"camera", on?}
-//                 {action:"videoFrame", key, data}   our camera, H.264 Annex-B (base64)
+//                 {action:"videoFrame", key, data, screen, w, h}   our camera or screen, H.264 Annex-B (base64)
 //                 {action:"device", kind:"mic"|"speaker", id}   PulseAudio source / sink ("" = default)
 //                 {action:"screen", on}               our screen replaces the camera
 //                 {action:"log", text}                a line for the engine log
@@ -79,6 +79,12 @@ class ElectronCallUi {
     this._state({ ...this.state, cameraEncode: profile });
   }
 
+  // Group screen share: the shorter side at most maxShort px, bitrate bps.
+  setScreenEncode(profile) {
+    if (!this.state || !profile) return;
+    this._state({ ...this.state, screenEncode: profile });
+  }
+
   requestKeyFrame() {
     this._send({ type: 'keyframe' });
   }
@@ -135,7 +141,7 @@ class ElectronCallUi {
         this.cb.hangup();
         return;
       case 'videoFrame':
-        if (typeof m.data === 'string') this.cb.videoFrame({ key: !!m.key, data: Buffer.from(m.data, 'base64') });
+        if (typeof m.data === 'string') this.cb.videoFrame({ key: !!m.key, data: Buffer.from(m.data, 'base64'), screen: !!m.screen, w: m.w | 0, h: m.h | 0 });
         return;
       case 'camera':
         this.cb.camera(!!m.on);

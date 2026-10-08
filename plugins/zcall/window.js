@@ -13,7 +13,7 @@
  *                 {type:"keyframe"}                  the phone needs a key frame
  *                 {type:"close", text}
  *   ui -> engine  {action:"hangup"|"accept"|"reject"|"mute"|"speaker"|"camera", on?}
- *                 {action:"videoFrame", key, data}   our camera, H.264 Annex-B (base64)
+ *                 {action:"videoFrame", key, data, screen, w, h}   our camera or screen, H.264 Annex-B (base64)
  *                 {action:"device", kind:"mic"|"speaker", id}   PulseAudio source / sink ("" = default)
  *                 {action:"screen", on}               our screen replaces the camera
  *
@@ -526,10 +526,11 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuá»™c gá»
   }
   // Group layer 0. open() and a 1-1 state omit the key, which clears it.
   // status() keeps the key once the engine has set it.
-  let cameraEncode = null;
+  let cameraEncode = null, screenEncode = null;
   ipcRenderer.on('zcall-ui-state', (_e, s) => {
     state = s || {};
     cameraEncode = state.cameraEncode || null;
+    screenEncode = state.screenEncode || null;
     if (state.phase !== 'connected') {
       stopVideo(); stopLocal(); sharing = false;
       if (pendingScreen) { pendingScreen.stop(); pendingScreen = null; }
@@ -555,8 +556,19 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuá»™c gá»
   let scaler = null, scalerG = null;
   // One object per layer-0 key, so the encoder is not reconfigured every frame.
   let groupProfile = null, groupKey = '';
+  let groupScreen = null, groupScreenKey = '';
   function sendProfile() {
-    if (sharing) return PROFILES.screen;
+    if (sharing) {
+      // Group: the server's limit on the shorter side and bitrate (engine screenEncode).
+      const s = screenEncode;
+      if (!s || !(s.maxShort > 0)) return PROFILES.screen;
+      const k = s.maxShort + '/' + s.bitrate;
+      if (!groupScreen || groupScreenKey !== k) {
+        groupScreenKey = k;
+        groupScreen = Object.assign({}, PROFILES.screen, { maxShort: s.maxShort, bitrate: s.bitrate > 0 ? s.bitrate : PROFILES.screen.bitrate, codec: 'avc1.42E01F', screen: true });
+      }
+      return groupScreen;
+    }
     const e = cameraEncode;
     if (!e || !(e.width > 0) || !(e.height > 0)) return PROFILES.camera;
     const w = e.width & ~1, h = e.height & ~1;
@@ -582,35 +594,78 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuá»™c gá»
     for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
     return btoa(s);
   }
-  function encodeFrame(frame) {
+  // What the send path did in the last 5 s, one log line: frames the capture gave,
+  // skipped for the frame rate, skipped with the encoder queue full, handed to the
+  // encoder, chunks out (key), queue size and encoder state now. Group camera froze
+  // after ~3 s on 2026-10-08 (14 frames in 11 s left the engine): this shows where.
+  const tx = { got: 0, rep: 0, rate: 0, full: 0, enc: 0, out: 0, key: 0, at: performance.now() };
+  function txReport(now) {
+    if (now - tx.at < 5000) return;
+    act('log', { text: 'send ' + (sharing ? 'screen' : 'camera') + ' 5s: got ' + tx.got + ', repeated ' + tx.rep + ', rate-skip ' + tx.rate + ', queue-skip ' + tx.full +
+      ', encoded ' + tx.enc + ', out ' + tx.out + ' (' + tx.key + ' key), queue ' + (enc ? enc.encodeQueueSize : '-') + ', encoder ' + (enc ? enc.state : 'none') });
+    tx.got = tx.rep = tx.rate = tx.full = tx.enc = tx.out = tx.key = 0; tx.at = now;
+  }
+  // Also when the capture gives nothing at all (then 'got 0' says so).
+  setInterval(() => { if (local) txReport(performance.now()); }, 5000);
+  // A camera that stops for seconds (Iriun Webcam over Wi-Fi measured 2026-10-08:
+  // 25, 30, 5 frames, then nothing for 9 s, then 28 / s again, outside Zalo too):
+  // the phone keeps the last picture only if frames keep coming, and a member who
+  // starts watching in such a gap gets no key frame at all. So the last camera
+  // frame is encoded again, REPEAT_FPS times a second, after REPEAT_AFTER_MS
+  // without a new one (the key frame interval still applies).
+  const REPEAT_AFTER_MS = 600, REPEAT_FPS = 4;
+  let held = null, heldAt = 0, repeatAt = 0;
+  function holdFrame(frame) {
+    if (held) try { held.close(); } catch (_) {}
+    held = null;
+    try { held = frame.clone(); heldAt = performance.now(); } catch (_) {}
+  }
+  function dropHeld() { if (held) try { held.close(); } catch (_) {} held = null; }
+  setInterval(() => {
+    const now = performance.now();
+    if (!held || !local || local.kind !== 'camera' || sharing) return;
+    if (now - heldAt < REPEAT_AFTER_MS || now - repeatAt < 1000 / REPEAT_FPS) return;
+    repeatAt = now;
+    let f = null;
+    // A fresh timestamp: the encoder is given frames in increasing time.
+    try { f = new VideoFrame(held, { timestamp: Math.round(now * 1000) }); } catch (_) { dropHeld(); return; }
+    tx.rep++;
+    lastAt = 0; // the frame-rate gate is for the capture, not for these
+    encodeFrame(f, true);
+  }, 100);
+  function encodeFrame(frame, repeat) {
     let current = frame;
+    if (!repeat) {
+      tx.got++;
+      if (local && local.kind === 'camera' && !sharing) holdFrame(frame);
+    }
+    txReport(performance.now());
     try {
       const P = sendProfile();
       const now = performance.now();
-      if (now - lastAt < 1000 / P.fps - 5) return;
+      if (now - lastAt < 1000 / P.fps - 5) { tx.rate++; return; }
       lastAt = now;
       let w, h, src = current;
       if (P.exact) {
-        // Fit inside the announced layer and pad black, so the SPS matches sub 12.
+        // Exactly the announced layer, so the SPS matches sub 12. The camera fills it,
+        // cut at the centre (a 16:9 camera in the 2:1 layer loses a little at the top
+        // and bottom), instead of the black bars of a fit.
         // Software encoder: the hardware path on this N100 stalled the preview.
         w = P.width; h = P.height;
         if (!scaler || scaler.width !== w || scaler.height !== h) { scaler = new OffscreenCanvas(w, h); scalerG = scaler.getContext('2d'); }
         const sw = current.displayWidth || w, sh = current.displayHeight || h;
-        const fit = Math.min(w / sw, h / sh);
-        let dw = Math.round(sw * fit) & ~1, dh = Math.round(sh * fit) & ~1;
-        if (dw > w) dw = w; if (dh > h) dh = h;
-        if (dw < 2) dw = 2; if (dh < 2) dh = 2;
-        const dx = Math.floor((w - dw) / 2) & ~1, dy = Math.floor((h - dh) / 2) & ~1;
-        scalerG.fillStyle = '#000';
-        scalerG.fillRect(0, 0, w, h);
-        scalerG.drawImage(current, dx, dy, dw, dh);
+        const cover = Math.max(w / sw, h / sh);
+        const cw = Math.min(sw, Math.round(w / cover)), ch = Math.min(sh, Math.round(h / cover));
+        const cx = Math.floor((sw - cw) / 2), cy = Math.floor((sh - ch) / 2);
+        scalerG.drawImage(current, cx, cy, cw, ch, 0, 0, w, h);
         const ts = current.timestamp;
         const cam = current;
         current = new VideoFrame(scaler, { timestamp: ts });
         cam.close();
         src = scaler;
       } else {
-        const k = Math.min(1, P.maxSide / Math.max(current.displayWidth, current.displayHeight));
+        let k = Math.min(1, P.maxSide / Math.max(current.displayWidth, current.displayHeight));
+        if (P.maxShort > 0) k = Math.min(k, P.maxShort / Math.min(current.displayWidth, current.displayHeight));
         w = Math.round(current.displayWidth * k) & ~1; h = Math.round(current.displayHeight * k) & ~1;
         if (k < 1) {
           if (!scaler || scaler.width !== w || scaler.height !== h) { scaler = new OffscreenCanvas(w, h); scalerG = scaler.getContext('2d'); }
@@ -627,7 +682,8 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuá»™c gá»
         enc = new VideoEncoder({
           output: (chunk) => {
             const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data);
-            act('videoFrame', { key: chunk.type === 'key', data: b64(data) });
+            tx.out++; if (chunk.type === 'key') tx.key++;
+            act('videoFrame', { key: chunk.type === 'key', data: b64(data), screen: P === PROFILES.screen || !!P.screen, w: w, h: h });
           },
           error: (err) => {
             if (!encErrLogged) { encErrLogged = true; act('log', { text: 'encoder error ' + ((err && err.message) || err || 'unknown') }); }
@@ -642,7 +698,9 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuá»™c gá»
       if (self.width !== w || self.height !== h) { self.width = w; self.height = h; }
       sg.drawImage(src, 0, 0);
       document.body.classList.add('has-self');
+      if (enc.encodeQueueSize >= 3) tx.full++;
       if (enc.encodeQueueSize < 3) {
+        tx.enc++;
         const keyEvery = P.keyMs || KEY_MS;
         const key = forceKey || nFrames++ === 0 || now - lastKeyAt >= keyEvery;
         if (key) { forceKey = false; lastKeyAt = now; }
@@ -684,7 +742,10 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuá»™c gá»
     try {
       // Capture at the size the 1-1 path already used. The group layer is
       // scaled in the canvas; ideal 480x240 froze the camera on this PC.
-      const want = { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: PROFILES.camera.fps } };
+      // A group layer larger than 640 px (720x360 by default) is cut from a 1280x720
+      // capture, so it keeps its detail; 1-1 stays at 640x360.
+      const big = cameraEncode && cameraEncode.width > 640;
+      const want = { width: { ideal: big ? 1280 : 640 }, height: { ideal: big ? 720 : 360 }, frameRate: { ideal: PROFILES.camera.fps } };
       const camId = await chosenCamera();
       let stream;
       try { stream = await navigator.mediaDevices.getUserMedia({ video: camId ? Object.assign({ deviceId: { exact: camId } }, want) : want, audio: false }); }
@@ -775,6 +836,7 @@ const HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cuá»™c gá»
   }
   function stopLocal() {
     if (local) { local.stop(); local = null; }
+    dropHeld();
     curCamId = '';
     if (enc && enc.state !== 'closed') try { enc.close(); } catch (_) {}
     enc = null;

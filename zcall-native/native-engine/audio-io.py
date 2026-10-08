@@ -5,7 +5,9 @@ Spawned by backends/zrtc-media.js; network, SRTP and signalling stay in Node.
 Opus 16 kHz mono, 20 ms frames (opus/16000/1, PT 112).
 
 Framing on the pipes (big endian):
-  stdout  'A' u16 len, Opus          one encoded 20 ms microphone frame
+  stdout  'L' u8 level, u16 len, Opus one encoded 20 ms microphone frame; level is
+                                      its loudness in -dBov, 0..127 (RFC 6464, 127 =
+                                      silence), for the group audio-level extension
   stdin   'F' u32 idx, u32 src, u16 len, Opus
                                       one received frame; idx = ROC<<16 | seq
           'M' u8 on                   mute the microphone (sends silence)
@@ -551,6 +553,18 @@ def read_exact(fh, n: int) -> bytes | None:
     return bytes(out)
 
 
+def audio_level(pcm: bytes) -> int:
+    """RFC 6464 level of a frame: -dBov, 0 (full scale) .. 127 (silence).
+    The macOS client's group audio says 41..46 for speech (capture 2026-10-08)."""
+    a = array("h", pcm)
+    if not a:
+        return 127
+    rms = math.sqrt(sum(v * v for v in a) / len(a))
+    if rms < 1:
+        return 127
+    return min(127, max(0, int(round(-20 * math.log10(rms / 32768)))))
+
+
 def encoder_loop(args, opus, muted, out, lock, mic):
     err = ctypes.c_int(0)
     enc = opus.opus_encoder_create(16000, 1, OPUS_APPLICATION_VOIP, ctypes.byref(err))
@@ -592,12 +606,14 @@ def encoder_loop(args, opus, muted, out, lock, mic):
 
     sent = 0
     for pcm in source:
-        size = opus.opus_encode(enc, silence if muted.is_set() else pcm, FRAME, buf, len(buf))
+        frame = silence if muted.is_set() else pcm
+        size = opus.opus_encode(enc, frame, FRAME, buf, len(buf))
         if size <= 0:
             continue
+        level = audio_level(frame)
         with lock:
             try:
-                out.write(b"A" + struct.pack(">H", size) + buf.raw[:size])
+                out.write(b"L" + struct.pack(">BH", level, size) + buf.raw[:size])
                 out.flush()
             except (BrokenPipeError, ValueError):
                 return

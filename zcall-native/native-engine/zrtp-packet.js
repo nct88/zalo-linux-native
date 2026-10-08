@@ -135,10 +135,10 @@ function buildInitZrtpPacket({
 //    callId/peer slots (+0x38/+0x3c) unless subCmd is 6, and the group init
 //    leaves them 0: payload u32 0, u32 0, u16str session, u16str extra.
 //    extra (_sendRequestInitZRTPAllSelectedServer) is 4 bytes:
-//    [debugLoopback 0, 5, camera off (1), 1].
+//    [debugLoopback 0, 5, sending video (1), 1].
 //  - Ping: initZRTPPacketRequestInitZaviPing, cmd 0x33 subCmd 1, magic 0x7e,
 //    with the server's token; payload u32 0, u32 0, u16str session,
-//    u16str extra [0, 5, camera off (1)].
+//    u16str extra [0, 5, sending video (1)].
 // The first live test (2026-10-01) got a refusal for that layout, so
 // `layout` picks one of the candidates (the backend tries them in turn):
 //   zero        u32 0, u32 0, session, extra                (static reading, subCmd 4)
@@ -147,31 +147,52 @@ function buildInitZrtpPacket({
 //               (_buildPacketInternal writes them for subCmd 6 only)
 //   callId      u32 callId, u32 0, session, extra           (subCmd 4)
 //   callIdHost  u32 callId, u32 hostCall, session, extra    (subCmd 4)
-function groupExtra(cameraOff = true, initZrtp = true) {
-  const b = [0, 5, cameraOff ? 1 : 0];
+// Byte 2 is 1 while we send video. _sendRequestInitZRTPAllSelectedServer writes
+// (state & ~2) != 0; the macOS client sends 1 in every ZaviPing while its camera is
+// on and 0 once, when it was turned off (capture 2026-10-08). Read as "camera off"
+// before, ours said 0 with the camera on, and the SFU stopped forwarding our camera
+// at the next ping, 1 to 4 s after a member asked for it (the Mac's downlink).
+function groupExtra(videoOn = true, initZrtp = true) {
+  const b = [0, 5, videoOn ? 1 : 0];
   if (initZrtp) b.push(1);
   return Buffer.from(b);
 }
 
 const GROUP_INIT_LAYOUTS = ['zero', 'sub6', 'callId', 'callIdHost'];
 
-function buildGroupInitZrtpPacket({ host = false, uid = 0, sessId = '', cameraOff = true, callId = 0, hostCall = 0, layout = 'zero' }) {
+function buildGroupInitZrtpPacket({ host = false, uid = 0, sessId = '', videoOn = true, callId = 0, hostCall = 0, layout = 'zero' }) {
   const header = buildControlHeader({
     magic: MAGIC_BYTE,
     uid,
     cmd: host ? COMMANDS.INIT_CALL_CALLER : COMMANDS.INIT_CALL_CALLEE,
     subCmd: layout === 'sub6' ? 0x06 : 0x04,
   });
-  const extra = u16String(groupExtra(cameraOff, true));
+  const extra = u16String(groupExtra(videoOn, true));
   if (layout === 'sub6') return Buffer.concat([header, u32(callId), Buffer.from([host ? 1 : 0, 5, 0]), u16String(sessId), extra]);
   const a = layout === 'zero' ? 0 : callId;
   const b = layout === 'callIdHost' ? hostCall : 0;
   return Buffer.concat([header, u32(a), u32(b), u16String(sessId), extra]);
 }
 
-function buildZaviPingPacket({ uid = 0, token = 0, sessId = '', cameraOff = true }) {
+// Screen share in a group call: a second peer (macOS ShareScreenPeer, its own UDP
+// socket) whose UID is the shareScreenId 12044 answered. ShareScreenPeer::_initZrtp
+// calls the group initZRTPPacketRequestInitCall with isHost false (+0x94 cleared in
+// start), so cmd 12, subCmd 4, and extra [0, ShareScreenPeerConfig+0x6a, 1, 0], where
+// _startShareScreenPeer sets +0x6a to 0xff. _sendRequestZRTPPing sends a ZaviPing
+// with the share UID and token and an empty extra, which is not written.
+function buildShareInitZrtpPacket({ uid = 0, sessId = '' }) {
+  const header = buildControlHeader({ magic: MAGIC_BYTE, uid, cmd: COMMANDS.INIT_CALL_CALLEE, subCmd: 0x04 });
+  return Buffer.concat([header, u32(0), u32(0), u16String(sessId), u16String(Buffer.from([0, 0xff, 1, 0]))]);
+}
+
+function buildShareZaviPingPacket({ uid = 0, token = 0, sessId = '' }) {
   const header = buildControlHeader({ magic: MAGIC_BYTE, uid, token, cmd: COMMANDS.INIT_ZAVI_PING, subCmd: 0x01 });
-  return Buffer.concat([header, u32(0), u32(0), u16String(sessId), u16String(groupExtra(cameraOff, false))]);
+  return Buffer.concat([header, u32(0), u32(0), u16String(sessId)]);
+}
+
+function buildZaviPingPacket({ uid = 0, token = 0, sessId = '', videoOn = true }) {
+  const header = buildControlHeader({ magic: MAGIC_BYTE, uid, token, cmd: COMMANDS.INIT_ZAVI_PING, subCmd: 0x01 });
+  return Buffer.concat([header, u32(0), u32(0), u16String(sessId), u16String(groupExtra(videoOn, false))]);
 }
 
 // CMD_ZAVI_ROOM_UPDATED (MsgType 2 cmd 50, header UID = ours): u32 LE UID of
@@ -257,12 +278,12 @@ function buildGroupVidQualConfig({ uid = 0, token = 0, seq = 0, layers }) {
 // Layers macOS sends on sub 12, from GroupZRtcConfig::fromJson +
 // BuildQualityBitrateConfigs (mode of codec 60/61, flag false).
 // id = spatialIndex * 3 + temporalIndex. Bitrate on the wire is
-// (bitrateKbps * 1000 / 100) / 2^(temporalNum-1-temporalIndex).
+// bitrateKbps / 2^(temporalNum-1-temporalIndex), in kbps (macOS capture).
 // Width and height are maxWidth/maxHeight * factorNum/factorDen.
 // An empty or unusable table returns null: the real sender skips the packet.
 // encode is only spatial 0 / temporal 0. sfu is the extension registered for
 // that mode: codec 60/61 → short id 12, codec 4 → none, anything else → long
-// id 14. Layers 3 and 6 stay announced but are not encoded yet.
+// id 14. Only layer 0 is encoded, so the backend announces only that row.
 function groupVideoPlan(config) {
   if (!config || typeof config !== 'object') return null;
   const gc = config.groupcall;
@@ -273,6 +294,7 @@ function groupVideoPlan(config) {
   const maxH = Number(config.maxHeight) > 0 ? Math.trunc(Number(config.maxHeight)) : 720;
   const keyMs = Number(config.keyFrameIntervalMs) > 0 ? Math.trunc(Number(config.keyFrameIntervalMs)) : 1000;
   const layers = [];
+  const rows = []; // temporal 0 of each spatial layer: the sizes we can encode at
   let encode = null;
   let spatial = 0;
   for (const raw of gc.spatialLayers) {
@@ -286,18 +308,26 @@ function groupVideoPlan(config) {
     const width = Math.trunc(maxW * num / den) & ~1;
     const height = Math.trunc(maxH * num / den) & ~1;
     if (width <= 0 || height <= 0) continue;
-    const divided = Math.trunc(Math.trunc(kbps) * 1000 / 100);
+    // kbps on the wire: the macOS client announces 100 / 300 / 700 for 480x240 /
+    // 720x360 / 960x480 (capture 2026-10-08), not kbps * 10.
+    const divided = Math.trunc(kbps);
     for (let t = 0; t < temporal; t++) {
       const wire = Math.trunc(divided / (1 << (temporal - 1 - t))) >>> 0;
       const id = spatial * 3 + t;
       layers.push({ id, a: wire, b: width, c: height });
-      if (spatial === 0 && t === 0) {
-        encode = { width, height, fps: Math.trunc(fps), bitrate: wire * 100, keyMs };
-      }
+      if (t === 0) rows.push({ width, height, fps: Math.trunc(fps), kbps: wire });
     }
     spatial++;
   }
-  if (!layers.length || !encode) return null;
+  if (!layers.length || !rows.length) return null;
+  // One layer goes out, announced as id 0 (send). The macOS client sends two at
+  // once, 480x240 / 100 kbps and 720x360 / 300 kbps, 12 fps, and the phone and the
+  // Mac asked it for the second (capture 2026-10-08); our 480x240 looked soft next
+  // to it. So the second row by default: spatial index ZCALL_GROUP_CAM_LAYER (0, 1, 2).
+  const want = process.env.ZCALL_GROUP_CAM_LAYER !== undefined ? Number(process.env.ZCALL_GROUP_CAM_LAYER) : 1;
+  const row = rows[Math.min(Math.max(0, Math.trunc(want) || 0), rows.length - 1)];
+  encode = { width: row.width, height: row.height, fps: row.fps, bitrate: row.kbps * 1000, keyMs };
+  const send = [{ id: 0, a: row.kbps, b: row.width, c: row.height }];
   // fromJson writes this mode at GroupZRtcConfig+0x2f0, which is the CallType
   // dword _startPeer passes to VideoRtpRtcp. Codec 60 or 61 → 2, codec 4 → 3,
   // otherwise 1. Only 1 and 2 register an SFU extension.
@@ -305,7 +335,7 @@ function groupVideoPlan(config) {
   let sfu = { id: 14, long: true };
   if (codec === 60 || codec === 61) sfu = { id: 12, long: false };
   else if (codec === 4) sfu = null;
-  return { layers, encode, sfu };
+  return { layers, encode, send, sfu };
 }
 
 // cmd 33, no body. sub 14 MultiSync, sub 15 reference clock. Sent only when
@@ -408,12 +438,16 @@ function unwrapPacket(buf) {
       // Server answer to InitZRTP: result, callId, the token for media
       // headers, and our address as the server sees it ("ip|port").
       // A refusal is the result alone (_parsePacketInternal stops there).
+      // The group SFU's answer (subCmd 4) stops after the token: 12 bytes, no
+      // address (live 2026-10-08: 00000000 00000000 13e6df28).
       parsed.res = data.readUInt32LE(0);
-      if (parsed.res === 0 && data.length >= 14) {
+      if (parsed.res === 0 && data.length >= 12) {
         parsed.callId = data.readUInt32LE(4);
         parsed.serverToken = data.readUInt32LE(8);
-        const n = data.readUInt16LE(12);
-        parsed.publicAddr = data.slice(14, 14 + n).toString('latin1');
+        if (data.length >= 14) {
+          const n = data.readUInt16LE(12);
+          parsed.publicAddr = data.slice(14, 14 + n).toString('latin1');
+        }
       }
     } else if (initCmd && data.length >= 10) {
       parsed.callId = data.readUInt32LE(0);
@@ -455,6 +489,8 @@ module.exports = {
   buildControlHeader,
   buildInitZrtpPacket,
   buildGroupInitZrtpPacket,
+  buildShareInitZrtpPacket,
+  buildShareZaviPingPacket,
   GROUP_INIT_LAYOUTS,
   buildZaviPingPacket,
   parseRoomUpdated,

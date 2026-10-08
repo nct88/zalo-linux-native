@@ -35,6 +35,8 @@ const {
   wrapMediaPacket,
   buildInitZrtpPacket,
   buildGroupInitZrtpPacket,
+  buildShareInitZrtpPacket,
+  buildShareZaviPingPacket,
   GROUP_INIT_LAYOUTS,
   buildZaviPingPacket,
   parseRoomUpdated,
@@ -55,7 +57,7 @@ const {
   unwrapPacket,
 } = require('../zrtp-packet');
 const { masterFromSessId, sessionKeys, parseRtp, unprotectRtp, protectRtp } = require('../srtp-aes');
-const { FRAME_SAMPLES, buildAudioRtpHeader, buildGroupVideoRtpHeader } = require('../rtp');
+const { FRAME_SAMPLES, buildAudioRtpHeader, buildGroupAudioRtpHeader, buildGroupVideoRtpHeader } = require('../rtp');
 const { packetizeFrame, KEY_PT, DELTA_PT } = require('../video');
 const { RtcpFeedback } = require('../rtcp');
 
@@ -68,6 +70,7 @@ const TWCC_INTERVAL_MS = 50; // ZaloCall's cadence (captures 2026-09-29)
 const RTCP_REPORT_INTERVAL_MS = 1000;
 const PLI_MIN_GAP_MS = 1000; // one key frame request per second at most
 const RTCP_LOG_MS = 5000;
+const SHARE_BURST = 6; // screen packets per 1 ms tick
 // Group ZaviPing period: the real engine takes it from its config
 // (GroupCallController +0x85c), value not known yet.
 const GROUP_PING_INTERVAL_MS = Number(process.env.ZCALL_GROUP_PING_MS) || 5000;
@@ -140,8 +143,11 @@ class ZrtcMediaBackend extends EventEmitter {
     this.vTsBase = Math.floor(Math.random() * 0x7fffffff);
     this.vStart = 0;
     this.vTx = 0;
+    this.vLayerSeq = 0; // group: SFU extension packet counter of the camera layer
+    this.ctlSeq = 0; // group: header seq of cmd 32 sub 12 / 13, +1 per packet (macOS: 0, 1, 2, ...)
+    this.share = null; // group screen share peer (startShare), its own socket and token
     this.vKeySent = false; // the phone shows nothing until our first key frame
-    this.groupCameraOn = false; // ZaviPing camera bit, only when ZCALL_GROUP_CAMERA=1
+    this.groupCameraOn = false; // ZaviPing "sending video" bit (ZCALL_GROUP_CAMERA=0: never)
     this.rtcp = null; // RtcpFeedback, 1-1 calls only (set in onNegotiated)
     this.audioOctets = 0;
     this.lastPliAt = 0;
@@ -150,6 +156,7 @@ class ZrtcMediaBackend extends EventEmitter {
     this.renderWidth = new Map(); // group: member UID -> width of its tile in pixels, from the window
     this.vidAsked = new Map(); // group: member UID -> the quality id last requested
     this.unknownReplies = new Set();
+    this.memberAsks = new Map(); // group: member UID -> what it last asked the SFU for (sub 13)
     this.vidQualLogged = false;
     this.vidCfgLogged = false;
     this.keyRequests = 0;  // PLI / FIR from the peer
@@ -297,6 +304,9 @@ class ZrtcMediaBackend extends EventEmitter {
         this.activeServer = best.server;
         this.serverToken = best.token;
         this.log(`media: ${this.replies.length}/${this.servers.length} servers answered, best rtt ${best.rttMs} ms`);
+        // Group: every cmd 32 / 33 header carries this token. 0 here means the SFU's
+        // answer did not hold one where the 1-1 answer has it: the raw reply shows.
+        if (this.group) this.log(`media: group InitZRTP reply, token ${best.token >>> 0}: ${best.hex}`);
         resolve(best);
       };
       let waiting = null;
@@ -335,6 +345,10 @@ class ZrtcMediaBackend extends EventEmitter {
     if (this.group) {
       // Members may all be muted: no media timeout, the server's cmd 3 and
       // Zalo's group_end_call end the call.
+      // Loopback check of our camera, as for the screen: ask the SFU for our own
+      // UID, layer 0. 'video rx member <our uid>' then shows whether it forwards
+      // the camera (host or not). Diagnostic, ZCALL_CAM_LOOPBACK=1.
+      if (process.env.ZCALL_CAM_LOOPBACK === '1' && this.params.localUid) this.vidWanted.add(this.params.localUid >>> 0);
       this._sendPing();
       this._timer(() => this._sendPing(), GROUP_PING_INTERVAL_MS, true);
       this._timer(() => this._checkGroupKey(), 3000);
@@ -447,6 +461,7 @@ class ZrtcMediaBackend extends EventEmitter {
   }
 
   stop() {
+    this.stopShare();
     if (this.active && this.params) {
       if (this.activeServer && this.serverToken) this._sendEndCall(this.activeServer, this.serverToken);
       for (const r of this.replies) this._sendEndCall(r.server, r.token);
@@ -515,19 +530,27 @@ class ZrtcMediaBackend extends EventEmitter {
     let buf = Buffer.alloc(0);
     this.audio.stdout.on('data', (d) => {
       buf = Buffer.concat([buf, d]);
-      while (buf.length >= 3 && buf[0] === 0x41) {
-        const n = buf.readUInt16BE(1);
-        if (buf.length < 3 + n) break;
-        this._sendAudioFrame(buf.subarray(3, 3 + n));
-        buf = buf.subarray(3 + n);
+      // 'A' u16 len, Opus (older audio-io) or 'L' u8 level, u16 len, Opus.
+      for (;;) {
+        if (buf.length >= 3 && buf[0] === 0x41) {
+          const n = buf.readUInt16BE(1);
+          if (buf.length < 3 + n) break;
+          this._sendAudioFrame(buf.subarray(3, 3 + n));
+          buf = buf.subarray(3 + n);
+        } else if (buf.length >= 4 && buf[0] === 0x4c) {
+          const n = buf.readUInt16BE(2);
+          if (buf.length < 4 + n) break;
+          this._sendAudioFrame(buf.subarray(4, 4 + n), buf[1]);
+          buf = buf.subarray(4 + n);
+        } else break;
       }
     });
   }
 
-  _sendAudioFrame(opus) {
+  _sendAudioFrame(opus, level = 127) {
     if (!this.active || !this.activeServer || (!this.srtpContext && !this.plainMedia)) return;
     const ssrc = this.params.localUid >>> 0;
-    const hdr = buildAudioRtpHeader({ seq: this.seq, ts: this.ts, ssrc, twSeq: this.twSeq });
+    const hdr = (this.group ? buildGroupAudioRtpHeader : buildAudioRtpHeader)({ seq: this.seq, ts: this.ts, ssrc, twSeq: this.twSeq, level });
     const rtp = this.plainMedia ? Buffer.concat([hdr, Buffer.from(opus)])
       : protectRtp(hdr, Buffer.from(opus), this.srtpContext, this.seq, ssrc, this.roc);
     this._send(wrapMediaPacket({ msgType: MSG_TYPES.AUDIO_RTP, token: this.serverToken, payload: rtp }), this.activeServer, 'audio');
@@ -547,17 +570,20 @@ class ZrtcMediaBackend extends EventEmitter {
   // Relay: MsgType 13 with the token (like audio type 3); P2P: kind 8.
   // Until a key frame went out, other frames are useless to the phone: drop
   // them and ask for a key frame ('keyframe' event) instead.
-  // Group calls with an empty srtpKey send plain RTP. ZCALL_GROUP_CAMERA=1
-  // sends layer-0 H.264 that way (type 13, PT 98/97). When groupVideoPlan
-  // produced an SFU extension (id 12 short or id 14 long), each packet carries
-  // it after transport-cc. Codec 4 registers none. Off by default.
+  // Group calls with an empty srtpKey send plain RTP: our H.264 goes out that way
+  // (type 13, PT 98/97) with the header of buildGroupVideoRtpHeader. On by default
+  // since it works with a phone and the macOS client (2026-10-08);
+  // ZCALL_GROUP_CAMERA=0 keeps the camera to ourselves.
   _groupCameraSend() {
-    return this.group && this.plainMedia && process.env.ZCALL_GROUP_CAMERA === '1';
+    return this.group && this.plainMedia && process.env.ZCALL_GROUP_CAMERA !== '0';
   }
 
   setGroupCamera(on) { this.groupCameraOn = !!on; }
 
-  sendVideoFrame({ key, data }) {
+  sendVideoFrame({ key, data, screen = false, w = 0, h = 0 }) {
+    // Group: the screen goes out on the share peer (SSRC = shareScreenId), never in
+    // the camera stream, which the phone shows in our own tile.
+    if (this.group && screen) { this._sendShareFrame({ key, data, w, h }); return; }
     const groupCam = this._groupCameraSend();
     if (!this.active || !this.activeServer || !this.startedAt) return;
     if (!this.srtpContext && !groupCam) return;
@@ -568,8 +594,9 @@ class ZrtcMediaBackend extends EventEmitter {
     const ts = (this.vTsBase + (Date.now() - this.vStart) * 90) >>> 0;
     const chunks = packetizeFrame(data);
     const sfu = groupCam && this.videoPlan && this.videoPlan.sfu;
+    const captureMs = Date.now(); // id 13 of every packet of this frame
     chunks.forEach((chunk, i) => {
-      const hdrArgs = { seq: this.vSeq, ts, ssrc, twSeq: this.twSeq, marker: i === chunks.length - 1, pt: key ? KEY_PT : DELTA_PT };
+      const hdrArgs = { seq: this.vSeq, ts, ssrc, twSeq: this.twSeq, marker: i === chunks.length - 1, pt: key ? KEY_PT : DELTA_PT, layerSeq: sfu ? (this.vLayerSeq = (this.vLayerSeq + 1) & 0xffff) : 0, captureMs };
       const hdr = sfu ? buildGroupVideoRtpHeader(Object.assign({ sfu }, hdrArgs)) : buildAudioRtpHeader(hdrArgs);
       const rtp = groupCam ? Buffer.concat([hdr, chunk])
         : protectRtp(hdr, chunk, this.srtpContext, this.vSeq, ssrc, this.vRoc);
@@ -585,6 +612,147 @@ class ZrtcMediaBackend extends EventEmitter {
       const head = chunks[0].subarray(0, Math.min(8, chunks[0].length)).toString('hex');
       this.log('media: group camera probe: plain H.264, type 13, PT 98/97, ' + ext + ', payload ' + head);
     }
+  }
+
+  // Group screen share (macOS GroupCallPeer::_startShareScreenPeer -> ShareScreenPeer):
+  // a second peer with its own UDP socket and UID = shareScreenId, InitZRTP to the
+  // server the call uses, its own token, ZaviPing on the group tick, a one-layer
+  // VidQualConfig (sub 12) for that UID, and the screen as plain RTP with
+  // SSRC = shareScreenId. The phone opens a tile for the share UID once 12097 lists
+  // it (type 1, ownerId = us); until this peer sends, that tile stays black.
+  startShare(shareId) {
+    shareId >>>= 0;
+    if (!this.group || !this.sendUdp || !this.active || !this.activeServer || !shareId) return;
+    if (this.share && this.share.uid === shareId) return;
+    this.stopShare();
+    const sock = dgram.createSocket('udp4');
+    const sh = { uid: shareId, sock, token: 0, timers: [], seq: Math.floor(Math.random() * 0x8000), twSeq: 1, layerSeq: 0, ctlSeq: 0,
+      keySent: false, queue: [], draining: false, tsBase: Math.floor(Math.random() * 0x7fffffff), start: 0, tx: 0, w: 0, h: 0, cfgLogged: false, unknown: new Set() };
+    this.share = sh;
+    sock.on('error', (err) => this.log('media: share socket error:', err.message));
+    sock.on('message', (msg) => this._onShareMessage(sh, msg));
+    const sessId = this.params.sessId || '';
+    const init = buildShareInitZrtpPacket({ uid: shareId, sessId });
+    let tries = 0;
+    const sendInit = () => {
+      if (this.share !== sh || sh.token) return;
+      if (tries++ >= INIT_TRIES) { this.log('media: share peer: no answer to InitZRTP'); return; }
+      this._shareSend(sh, init, 'share InitZRTP');
+      sh.timers.push(setTimeout(sendInit, INIT_RETRY_MS));
+    };
+    this.log(`media: share peer ${shareId}: InitZRTP to ${this.activeServer.host}:${this.activeServer.port}`);
+    sendInit();
+  }
+
+  stopShare() {
+    const sh = this.share;
+    if (!sh) return;
+    this.share = null;
+    if (this.vidWanted.delete(sh.uid)) { this.vidAsked.delete(sh.uid); }
+    for (const t of sh.timers) { clearTimeout(t); clearInterval(t); }
+    if (sh.token && this.activeServer) {
+      this._shareSend(sh, buildEndCallPacket({ uid: sh.uid, token: sh.token, callId: (this.params && this.params.callId) || 0 }), 'share EndCall');
+    }
+    this.log(`media: share peer ${sh.uid} stopped, ${sh.tx} frame(s) sent`);
+    setTimeout(() => { try { sh.sock.close(); } catch (_) {} }, 100);
+  }
+
+  _shareSend(sh, packet, what) {
+    if (!this.activeServer) return;
+    sh.sock.send(packet, this.activeServer.port, this.activeServer.host, (err) => {
+      if (err) this.log(`media: ${what} send error:`, err.message);
+    });
+  }
+
+  _onShareMessage(sh, msg) {
+    if (this.share !== sh || !msg.length) return;
+    if (msg[0] === MSG_TYPES.VIDEO_FEC && msg.length > 5) { this._onShareRtcp(sh, msg.subarray(5)); return; }
+    const p = unwrapPacket(msg);
+    if (!p) return;
+    if (p.msgType === MSG_TYPES.SERVER_REPLY && (p.cmd === COMMANDS.INIT_CALL_CALLER || p.cmd === COMMANDS.INIT_CALL_CALLEE)) {
+      if (sh.token) return;
+      if (p.res !== 0 || !p.serverToken) { this.log(`media: share peer InitZRTP refused, res ${p.res}: ${msg.toString('hex')}`); return; }
+      sh.token = p.serverToken >>> 0;
+      sh.start = Date.now();
+      this.log(`media: share peer ${sh.uid} accepted, token ${sh.token}`);
+      const tick = () => {
+        if (this.share !== sh) return;
+        this._shareSend(sh, buildShareZaviPingPacket({ uid: sh.uid, token: sh.token, sessId: this.params.sessId || '' }), 'share ZaviPing');
+        this._sendShareVidQualConfig(sh);
+      };
+      tick();
+      sh.timers.push(setInterval(tick, GROUP_PING_INTERVAL_MS));
+      this.emit('keyframe', 'share');
+      // Loopback check: ask the SFU for our own screen on the main peer, layer 0.
+      // What comes back (video rx member <shareId>) shows whether the SFU forwards
+      // it and whether it decodes, without another device. Diagnostic, ZCALL_SHARE_LOOPBACK=1.
+      if (process.env.ZCALL_SHARE_LOOPBACK === '1') { this.vidWanted.add(sh.uid); this._sendVidQual(); }
+      return;
+    }
+    const key = `${p.msgType}/${p.cmd}/${p.subCmd}`;
+    if (sh.unknown.has(key) || sh.unknown.size >= 10) return;
+    sh.unknown.add(key);
+    this.log(`media: share peer reply type ${p.msgType} cmd ${p.cmd} sub ${p.subCmd}, ${msg.length} bytes: ${msg.subarray(0, Math.min(msg.length, 64)).toString('hex')}`);
+  }
+
+  // PLI / FIR for the share SSRC: a key frame of the screen.
+  _onShareRtcp(sh, buf) {
+    for (let o = 0; o + 12 <= buf.length;) {
+      if ((buf[o] >> 6) !== 2) return;
+      const len = (buf.readUInt16BE(o + 2) + 1) * 4;
+      const fmt = buf[o] & 0x1f;
+      if (buf[o + 1] === 206 && (fmt === 1 || (fmt === 4 && o + 16 <= buf.length))) {
+        const target = fmt === 1 ? buf.readUInt32BE(o + 8) : buf.readUInt32BE(o + 12);
+        if (target === sh.uid) { this.log('media: share peer: key frame request'); this.emit('keyframe', 'share-pli'); }
+      }
+      o += len;
+    }
+  }
+
+  // One layer, the size the window encodes the screen at; bitrate in kbps (the
+  // camera table's unit), maxShrScreenBr of zrtcConfig (1500 by default).
+  _sendShareVidQualConfig(sh) {
+    if (!sh.w || !sh.h) return;
+    const cfg = (this.params && this.params.config) || {};
+    const kbps = Number(cfg.maxShrScreenBr) > 0 ? Math.trunc(Number(cfg.maxShrScreenBr)) : 1500;
+    const pkt = buildGroupVidQualConfig({ uid: sh.uid, token: sh.token, seq: sh.ctlSeq++, layers: [{ id: 0, a: kbps, b: sh.w, c: sh.h }] });
+    this._shareSend(sh, pkt, 'share VidQualConfig');
+    if (!sh.cfgLogged) { sh.cfgLogged = true; this.log(`media: share VidQualConfig ${sh.w}x${sh.h} ${kbps} kbps: ${pkt.toString('hex')}`); }
+  }
+
+  // A screen key frame is tens of packets. Sent in one burst the SFU or the path
+  // loses some, and with no retransmission the picture never decodes. Out in
+  // groups of SHARE_BURST, one group per millisecond tick.
+  _drainShare(sh) {
+    if (sh.draining) return;
+    sh.draining = true;
+    const step = () => {
+      if (this.share !== sh) { sh.queue.length = 0; sh.draining = false; return; }
+      for (const pkt of sh.queue.splice(0, SHARE_BURST)) this._shareSend(sh, pkt, 'share video');
+      if (sh.queue.length) setTimeout(step, 1); else sh.draining = false;
+    };
+    step();
+  }
+
+  _sendShareFrame({ key, data, w, h }) {
+    const sh = this.share;
+    if (!sh || !sh.token) return;
+    if (w > 0 && h > 0 && (w !== sh.w || h !== sh.h)) { sh.w = w; sh.h = h; this._sendShareVidQualConfig(sh); }
+    if (!key && !sh.keySent) { this.emit('keyframe', 'share-start'); return; }
+    if (key) sh.keySent = true;
+    const ts = (sh.tsBase + (Date.now() - sh.start) * 90) >>> 0;
+    const sfu = (this.videoPlan && this.videoPlan.sfu) || { id: 12, long: false };
+    const chunks = packetizeFrame(data);
+    const captureMs = Date.now();
+    chunks.forEach((chunk, i) => {
+      const hdr = buildGroupVideoRtpHeader({ captureMs, sfu, seq: sh.seq, ts, ssrc: sh.uid, twSeq: sh.twSeq, marker: i === chunks.length - 1, pt: key ? KEY_PT : DELTA_PT, layerSeq: (sh.layerSeq = (sh.layerSeq + 1) & 0xffff) });
+      sh.queue.push(wrapMediaPacket({ msgType: MSG_TYPES.VIDEO_RTP, token: sh.token, payload: Buffer.concat([hdr, chunk]) }));
+      sh.seq = (sh.seq + 1) & 0xffff;
+      sh.twSeq = (sh.twSeq + 1) & 0xffff;
+    });
+    this._drainShare(sh);
+    sh.tx++;
+    if (sh.tx === 1) this.log(`media: share peer first frame (${key ? 'key' : 'delta'}, ${w}x${h}, ${chunks.length} packet(s))`);
   }
 
   // One RTCP compound: relay (MsgType 5 audio / 0x0F video, 5-byte header) and, once the
@@ -671,13 +839,19 @@ class ZrtcMediaBackend extends EventEmitter {
   _sendVidQualConfig() {
     const plan = this.videoPlan;
     if (!this.group || !this.activeServer || !plan || !plan.layers.length) return;
-    this._send(buildGroupVidQualConfig({
-      uid: this.params.localUid || 0, token: this.serverToken, seq: 0, layers: plan.layers,
-    }), this.activeServer, 'VidQualConfig');
+    // Only the layer the window encodes. With 0 / 3 / 6 announced the phone asked
+    // for 3 (its tile is wider than layer 0), which we never send, and our tile
+    // froze on the first picture (live 2026-10-08 17:25). The share peer, one layer,
+    // was asked for 0 at once.
+    const layers = plan.send || plan.layers.filter((L) => L.id === 0);
+    const pkt = buildGroupVidQualConfig({
+      uid: this.params.localUid || 0, token: this.serverToken, seq: this.ctlSeq++, layers,
+    });
+    this._send(pkt, this.activeServer, 'VidQualConfig');
     if (!this.vidCfgLogged) {
       this.vidCfgLogged = true;
       const e = plan.encode;
-      this.log(`media: VidQualConfig ${plan.layers.length} layer(s), encode ${e.width}x${e.height} ${e.bitrate} bps ${e.fps} fps`);
+      this.log(`media: VidQualConfig ${layers.length} layer(s), encode ${e.width}x${e.height} ${e.bitrate} bps ${e.fps} fps: ${pkt.toString('hex')}`);
     }
   }
 
@@ -685,7 +859,7 @@ class ZrtcMediaBackend extends EventEmitter {
     if (!this.group || !this.activeServer || !this.vidWanted.size) return;
     const entries = [...this.vidWanted].map((uid) => ({ uid, qualityId: this.qualityIdFor(uid) }));
     this._send(buildGroupVidQualReq({
-      uid: this.params.localUid || 0, token: this.serverToken, seq: 0, entries,
+      uid: this.params.localUid || 0, token: this.serverToken, seq: this.ctlSeq++, entries,
     }), this.activeServer, 'VidQual');
     for (const e of entries) {
       if (this.vidAsked.get(e.uid) === e.qualityId) continue;
@@ -703,6 +877,8 @@ class ZrtcMediaBackend extends EventEmitter {
   // landscape sender gets a layer that is bigger than it needs, never smaller.
   // 0xff (what the engine always sent before) stays until the window reported the tile.
   qualityIdFor(uid) {
+    if (this.share && (uid >>> 0) === this.share.uid) return 0; // our own screen, loopback check
+    if (process.env.ZCALL_CAM_LOOPBACK === '1' && (uid >>> 0) === ((this.params && this.params.localUid) >>> 0)) return 0; // our own camera, loopback check
     const plan = this.videoPlan;
     const w = this.renderWidth.get(uid);
     if (process.env.ZCALL_GROUP_QUALITY === '0' || !plan || !plan.layers.length || !w) return 0xff;
@@ -723,8 +899,8 @@ class ZrtcMediaBackend extends EventEmitter {
   _sendPing() {
     if (this.group) {
       const uid = this.params.localUid || 0;
-      const cameraOff = !(this._groupCameraSend() && this.groupCameraOn);
-      this._send(buildZaviPingPacket({ uid, token: this.serverToken, sessId: this.params.sessId || '', cameraOff }), this.activeServer, 'ZaviPing');
+      const videoOn = this._groupCameraSend() && this.groupCameraOn;
+      this._send(buildZaviPingPacket({ uid, token: this.serverToken, sessId: this.params.sessId || '', videoOn }), this.activeServer, 'ZaviPing');
       this._sendVidQual();
       this._sendVidQualConfig();
       return;
@@ -771,7 +947,7 @@ class ZrtcMediaBackend extends EventEmitter {
         if (this._onInitReply) this._onInitReply();
         return;
       }
-      this.replies.push({ server, token: p.serverToken, rttMs: Date.now() - this.initSentAt, publicAddr: p.publicAddr });
+      this.replies.push({ server, token: p.serverToken, rttMs: Date.now() - this.initSentAt, publicAddr: p.publicAddr, hex: msg.toString('hex') });
       if (this._onInitReply) this._onInitReply();
       return;
     }
@@ -786,7 +962,26 @@ class ZrtcMediaBackend extends EventEmitter {
     }
     if (p.isMedia && p.msgType === MSG_TYPES.AUDIO_RTP_DOWN) this._onAudio(p.payload);
     else if (p.isMedia && p.msgType === MSG_TYPES.VIDEO_DOWN) this._onVideo(p.payload);
+    else if (this.group && !p.isMedia && p.cmd === COMMANDS.REQ_FORWARD && p.subCmd === 0x0d) this._onMemberVidQualReq(msg);
     else if (this.group && !p.isMedia) this._noteUnknownReply(p, msg);
+  }
+
+  // cmd 32 sub 13 relayed from another member: the layer that member asks the SFU
+  // for, per sender (u8 count, then u32 LE uid + u8 qualityId). 0xff = do not send
+  // me this sender's video (macOS getVideoQualityIdReceiving: tile width 0, or no
+  // layer table for that sender). Logged whenever a member's request changes.
+  _onMemberVidQualReq(msg) {
+    if (msg.length < 24) return;
+    const from = msg.readUInt32LE(10);
+    const n = msg[23];
+    const asks = [];
+    for (let i = 0, o = 24; i < n && o + 5 <= msg.length; i++, o += 5) {
+      asks.push(`${msg.readUInt32LE(o)}=0x${msg[o + 4].toString(16)}`);
+    }
+    const line = asks.join(' ');
+    if (this.memberAsks.get(from) === line) return;
+    this.memberAsks.set(from, line);
+    this.log(`media: member ${from} asks the SFU for: ${line || '(nothing)'}`);
   }
 
   // Compound RTCP: PSFB (206) fmt 1 PLI / fmt 4 FIR aimed at our SSRC (= our UID).
@@ -845,6 +1040,7 @@ class ZrtcMediaBackend extends EventEmitter {
         this.log('media: first video rtp', rtp.subarray(0, Math.min(40, rtp.length)).toString('hex'));
       }
       m.pkts++;
+      this._noteMemberRtpExt(got.ssrc, m, rtp);
       m.pt[rtp[1] & 0x7f] = (m.pt[rtp[1] & 0x7f] || 0) + 1;
       const hd = got.opus.subarray(0, got.opus[0] === 0x1c ? 2 : 5).toString('hex');
       if (Object.keys(m.head).length < 12 || m.head[hd]) m.head[hd] = (m.head[hd] || 0) + 1;
@@ -868,6 +1064,33 @@ class ZrtcMediaBackend extends EventEmitter {
     }
     this.emit('video', { seq, ts, pt, marker, payload: got.opus, roc, ssrc: got.ssrc });
     if (this.group) this._noteVideoMember(got.ssrc);
+  }
+
+  // Group: the one-byte RTP header extensions of a member's video as the SFU
+  // forwards it. Each new id 12 / 14 (SFU) value is logged with the PT and marker of
+  // its packet, at most 16 per member, so the next call shows what the layer bytes
+  // of a sender the SFU accepts look like on key and delta frames.
+  _noteMemberRtpExt(ssrc, m, rtp) {
+    if (!(rtp[0] & 0x10) || rtp.length < 16 || rtp.readUInt16BE(12) !== 0xbede) return;
+    const end = Math.min(rtp.length, 16 + rtp.readUInt16BE(14) * 4);
+    const ids = [];
+    let sfu = null;
+    for (let o = 16; o < end;) {
+      if (rtp[o] === 0) { o++; continue; }
+      const id = rtp[o] >> 4;
+      const len = (rtp[o] & 0x0f) + 1;
+      if (id === 15 || o + 1 + len > end) break;
+      ids.push(id);
+      if (id === 12 || id === 14) sfu = rtp.subarray(o + 1, o + 1 + len).toString('hex');
+      o += 1 + len;
+    }
+    if (!m.sfu) {
+      m.sfu = new Set();
+      this.log(`media: member ${ssrc} video extension ids ${ids.join(',')}`);
+    }
+    if (sfu === null || m.sfu.has(sfu) || m.sfu.size >= 16) return;
+    m.sfu.add(sfu);
+    this.log(`media: member ${ssrc} SFU ext ${sfu} (PT ${rtp[1] & 0x7f}${rtp[1] & 0x80 ? ', marker' : ''}, packet ${m.pkts})`);
   }
 
   // Group: what else the server sends (the partners' layer tables, the answer to our
