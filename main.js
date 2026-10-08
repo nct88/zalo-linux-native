@@ -178,7 +178,8 @@ app.on('browser-window-created', (_evt, win) => {
   // hidden window could never come back: quit instead.
   win.on('close', (event) => {
     if (isAppQuitting) return;
-    if (tray && trayHost.isAvailable() && (win === mainWindow || win.getTitle().includes('Zalo'))) {
+    // Not the call windows ("Zalo Call - …", the incoming notice): closing those ends / declines the call.
+    if (tray && trayHost.isAvailable() && !win.zcallWindow && (win === mainWindow || win.getTitle().includes('Zalo'))) {
       event.preventDefault();
       setTimeout(() => {
         if (!isAppQuitting && !win.isDestroyed()) win.hide();

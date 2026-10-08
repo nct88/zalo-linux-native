@@ -157,6 +157,7 @@ function ensureWindow() {
     // Local static page; the only remote content is the avatar image.
     webPreferences: { contextIsolation: false, nodeIntegration: true },
   });
+  win.zcallWindow = true; // main.js: closing it ends the call, it does not hide to the tray
   win.setMenuBarVisibility(false);
   // The size above counted the (now hidden) menu bar in: 25 px too tall without this.
   win.setContentSize(VOICE_WIDTH, VOICE_HEIGHT);
@@ -323,15 +324,12 @@ function start() {
     const s = sources.find((x) => x.id.startsWith('screen:')) || sources[0];
     return s ? s.id : null;
   });
-  // Window controls of the page: minimize / compact / expand, and restore.
-  // The desktop's screen picker belongs to Zalo's main window and opens
-  // under our always-on-top one (clearing always-on-top does not help under
-  // XWayland): the page has us minimized until the share starts or fails.
+  // Compact / expand, from the page. Picking the screen to share happens with
+  // the window compact and focused: GNOME puts the portal's dialog right under
+  // the focused window, so above Zalo's main window (see ui/call.js).
   ipcMain.on('zcall-ui-window', (_e, op) => {
     if (!win || win.isDestroyed()) return;
-    if (op === 'minimize') win.minimize();
-    else if (op === 'restore') { win.restore(); win.show(); }
-    else if (op === 'compact' || op === 'expand') { win.restore(); win.show(); setCompact(op === 'compact'); }
+    if (op === 'compact' || op === 'expand') { win.restore(); win.show(); setCompact(op === 'compact'); win.focus(); }
   });
   // The notice's answer: accept, maybe with the camera off; the call window opens with the next state.
   ipcMain.on('zcall-incoming-answer', (_e, opts) => {

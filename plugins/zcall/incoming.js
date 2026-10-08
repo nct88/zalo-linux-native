@@ -52,7 +52,7 @@ function show(state, assetsDir) {
     maximizable: false,
     minimizable: false,
     fullscreenable: false,
-    alwaysOnTop: true,
+    alwaysOnTop: false, // set once shown, see below
     skipTaskbar: false,
     show: false,
     title: 'Zalo: cuộc gọi đến',
@@ -60,11 +60,16 @@ function show(state, assetsDir) {
     // Local static page; the only remote content is the avatar image.
     webPreferences: { contextIsolation: false, nodeIntegration: true },
   });
+  win.zcallWindow = true; // main.js: closing it declines, it does not hide to the tray
   win.setMenuBarVisibility(false);
   win.webContents.on('did-finish-load', () => {
     ready = true;
     if (pending) win.webContents.send('zcall-incoming-state', pending);
     win.showInactive();
+    // alwaysOnTop of the constructor does not reach a window shown later (X11:
+    // no _NET_WM_STATE_ABOVE, the notice stayed under Zalo's main window).
+    win.setAlwaysOnTop(true);
+    win.moveTop();
     win.flashFrame(true);
   });
   win.on('closed', () => { win = null; ready = false; pending = null; });

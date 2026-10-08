@@ -371,8 +371,11 @@ async function startLocal() {
   }
 }
 // Our screen in place of the camera. On Wayland the desktop's portal asks
-// which screen only once the capture runs, so the window stays minimized
-// (see 'zcall-ui-window') and the camera on until the first screen frame;
+// which screen only once the capture runs. GNOME denies the portal's dialog
+// the focus and puts it right under the focused window: with this window
+// minimized that was Zalo's main window, which hid the dialog. So the window
+// goes compact in the screen's corner and keeps the focus: the dialog comes
+// right under it, above Zalo's main window. The camera stays on until the first screen frame;
 // cancelling, or 60 s without a pick, gives up. Stopping it from the
 // desktop's indicator ends the share.
 // A failure within 3 s of the click is not the user cancelling: the first
@@ -392,9 +395,9 @@ async function startScreen(attempt = 1) {
       setTimeout(() => startScreen(2), 300);
       return;
     }
-    ipcRenderer.send('zcall-ui-window', 'restore');
+    if (autoCompact) { autoCompact = false; ipcRenderer.send('zcall-ui-window', 'expand'); }
   };
-  if (attempt === 1) ipcRenderer.send('zcall-ui-window', 'minimize');
+  if (attempt === 1 && !compactMode) { autoCompact = true; ipcRenderer.send('zcall-ui-window', 'compact'); }
   let stream;
   try {
     const id = await ipcRenderer.invoke('zcall-ui-screen-source');
@@ -412,8 +415,7 @@ async function startScreen(attempt = 1) {
     if (pendingScreen !== cap || state.phase !== 'connected') { giveUp('call over'); return false; }
     pendingScreen = null;
     act('log', { text: 'screen share started (attempt ' + attempt + ')' });
-    autoCompact = !compactMode;
-    ipcRenderer.send('zcall-ui-window', 'compact');
+    if (!compactMode) { autoCompact = true; ipcRenderer.send('zcall-ui-window', 'compact'); }
     stopLocal(); // the camera
     sharing = true;
     forceKey = true;
