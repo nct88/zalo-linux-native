@@ -76,6 +76,10 @@ Gọi điện cần thêm `python3`, libopus và bộ công cụ PulseAudio. N�
 | `ZALO_DISABLE_GPU=1` | Tắt tăng tốc GPU khi cửa sổ đen hoặc tiến trình GPU bị lỗi |
 | `ZCALL_MIC` / `ZCALL_SPEAKER` | Chọn micro / loa (tên nguồn PulseAudio). Nút ▾ trong cửa sổ gọi làm được việc này |
 | `ZCALL_AUDIO_PROCESSING=0` | Gọi không qua khử vọng / khử ồn |
+| `ZCALL_PW_RT=0` | Không xin RTKit ưu tiên thời gian thực cho PipeWire khi nó đang chạy ưu tiên thường (mặc định có xin: luồng âm thanh không có RT thì tiếng rè khi máy bận) |
+| `ZCALL_AUDIO_DIAG=0` | Không ghi dòng `diag:` (âm thanh, xrun, resync của PipeWire) vào log mỗi 10 giây |
+| `ZCALL_MIC_AGC=0` | Không tự hạ âm lượng micro khi tiếng bị xén đỉnh (mặc định hạ từng 3 dB, tối đa 24 dB, giống Zalo trên Windows / macOS) |
+| `ZCALL_AUDIO_DUMP=1` | Ghi âm thanh đã phát và âm thanh micro gửi đi của cuộc gọi vào `~/.config/ZaloData/call-*.raw` (để tìm lỗi; nhớ xoá sau khi dùng) |
 | `ZCALL_VERBOSE=1` | Ghi chi tiết cuộc gọi vào `~/.config/ZaloData/native-engine-*.log` |
 | `ZCALL_GROUP=0` | Tắt gọi nhóm (cửa sổ gọi báo chưa hỗ trợ) |
 | `ZCALL_GROUP_CAMERA=0` | Gọi nhóm không gửi camera |
@@ -180,6 +184,10 @@ Calls also need `python3`, libopus and the PulseAudio tools. If something is mis
 | `ZALO_DISABLE_GPU=1` | No GPU acceleration, when the window is black or the GPU process crashes |
 | `ZCALL_MIC` / `ZCALL_SPEAKER` | Microphone / speaker (PulseAudio source / sink name). The ▾ in the call window does the same |
 | `ZCALL_AUDIO_PROCESSING=0` | Calls without echo cancellation / noise suppression |
+| `ZCALL_PW_RT=0` | Do not ask RTKit for realtime priority when PipeWire's audio threads run at normal priority (asked by default: without it calls crackle on a busy PC) |
+| `ZCALL_AUDIO_DIAG=0` | No `diag:` line (audio, PipeWire xruns and resyncs) in the log every 10 seconds |
+| `ZCALL_MIC_AGC=0` | Do not turn the microphone down when it clips (3 dB steps, at most 24 dB by default, as Zalo on Windows / macOS) |
+| `ZCALL_AUDIO_DUMP=1` | Record what the call played and what the microphone sent to `~/.config/ZaloData/call-*.raw` (for bug hunting; delete them afterwards) |
 | `ZCALL_VERBOSE=1` | Log call details to `~/.config/ZaloData/native-engine-*.log` |
 | `ZCALL_GROUP=0` | No group calls (the call window says they are not supported) |
 | `ZCALL_GROUP_CAMERA=0` | Group calls without sending the camera |
