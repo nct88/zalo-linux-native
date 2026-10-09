@@ -1,6 +1,6 @@
 {
   "name": "zalo-linux-native",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Zalo for Linux with a native call engine: voice and video calls and screen sharing without Wine",
   "main": "main.js",
   "scripts": {
