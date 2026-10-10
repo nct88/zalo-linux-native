@@ -81,7 +81,7 @@ Gọi điện cần thêm `python3`, libopus và bộ công cụ PulseAudio. N�
 | `ZCALL_MIC_AGC=0` | Không tự hạ âm lượng micro khi tiếng bị xén đỉnh (mặc định hạ từng 3 dB, tối đa 24 dB, giống Zalo trên Windows / macOS) |
 | `ZCALL_GROUP_RTCP=0` | Gọi nhóm không gửi phản hồi mạng (transport-cc) cho máy chủ |
 | `ZCALL_AUDIO_DUMP=1` | Ghi âm thanh đã phát và âm thanh micro gửi đi của cuộc gọi vào `~/.config/ZaloData/call-*.raw` (để tìm lỗi; nhớ xoá sau khi dùng) |
-| `ZCALL_VIDEO_ADAPT=0` | Gọi video 1-1 giữ nguyên chất lượng gửi đi (360p 20 fps 500 kbps), không tự tăng / giảm theo mạng |
+| `ZCALL_VIDEO_ADAPT=0` | Gọi video 1-1 giữ nguyên chất lượng gửi đi (bậc đầu: 360p 15 fps 300 kbps), không tự tăng / giảm theo mạng |
 | `ZCALL_VIDEO_RUNG=4`…`7` | Bậc chất lượng camera lúc bắt đầu gọi 1-1 (bảng của máy chủ Zalo: 4 = 360p, 6 = 480p, 7 = 720p) |
 | `ZCALL_VERBOSE=1` | Ghi chi tiết cuộc gọi vào `~/.config/ZaloData/native-engine-*.log` |
 | `ZCALL_GROUP=0` | Tắt gọi nhóm (cửa sổ gọi báo chưa hỗ trợ) |
@@ -192,7 +192,7 @@ Calls also need `python3`, libopus and the PulseAudio tools. If something is mis
 | `ZCALL_MIC_AGC=0` | Do not turn the microphone down when it clips (3 dB steps, at most 24 dB by default, as Zalo on Windows / macOS) |
 | `ZCALL_GROUP_RTCP=0` | Group calls send no network feedback (transport-cc) to the server |
 | `ZCALL_AUDIO_DUMP=1` | Record what the call played and what the microphone sent to `~/.config/ZaloData/call-*.raw` (for bug hunting; delete them afterwards) |
-| `ZCALL_VIDEO_ADAPT=0` | 1-1 video calls keep the camera quality they start with (360p 20 fps 500 kbps), no steps up or down with the network |
+| `ZCALL_VIDEO_ADAPT=0` | 1-1 video calls keep the camera quality they start with (360p 15 fps 300 kbps), no steps up or down with the network |
 | `ZCALL_VIDEO_RUNG=4`…`7` | Camera quality a 1-1 call starts at (Zalo's server ladder: 4 = 360p, 6 = 480p, 7 = 720p) |
 | `ZCALL_VERBOSE=1` | Log call details to `~/.config/ZaloData/native-engine-*.log` |
 | `ZCALL_GROUP=0` | No group calls (the call window says they are not supported) |
